@@ -2,14 +2,16 @@ import csv
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Flask, Response, abort, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import atexit
@@ -114,12 +116,51 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 if os.environ.get("RENDER"):
     app.config["SESSION_COOKIE_SECURE"] = True
 
+
+@app.before_request
+def _assign_request_id():
+    g.request_id = request.headers.get("X-Request-ID") or secrets.token_hex(8)
+
+
+@app.after_request
+def _attach_request_id(response):
+    rid = getattr(g, "request_id", None)
+    if rid:
+        response.headers["X-Request-ID"] = rid
+    return response
+
+
+@app.teardown_request
+def _log_request_exception(exc):
+    if not exc:
+        return
+    import sys
+    import traceback
+
+    rid = getattr(g, "request_id", None)
+    payload = {
+        "level": "error",
+        "request_id": rid,
+        "method": request.method,
+        "path": request.path,
+        "query": request.query_string.decode("utf-8", errors="ignore"),
+        "remote_addr": request.headers.get("X-Forwarded-For") or request.remote_addr,
+        "ua": request.headers.get("User-Agent"),
+        "error": repr(exc),
+    }
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+    traceback.print_exc()
+
+
 _TASK_CACHE_TTL_SECONDS = 15.0
 _task_cache: dict[str, tuple[float, list[Task]]] = {}
+_ADMIN_REPORT_CACHE_TTL_SECONDS = 20.0
+_admin_report_cache: dict[str, tuple[float, str]] = {}
 
 _pool = None
 _db_initialized = False
 _db_init_lock = threading.Lock()
+_sqlite_swap_lock = threading.Lock()
 
 
 
@@ -175,7 +216,7 @@ def _get_pool():
 
 
 def _today_str() -> str:
-    return date.today().isoformat()
+    return datetime.now(_APP_TZ).date().isoformat()
 
 
 def _parse_date(value: str) -> str:
@@ -229,7 +270,8 @@ def _dt_to_iso(value) -> str | None:
     return str(value)
 
 
-_LOCAL_TZ = datetime.now().astimezone().tzinfo
+_APP_TZ = ZoneInfo(os.environ.get("APP_TIMEZONE") or "Asia/Kolkata")
+_LOCAL_TZ = _APP_TZ
 
 
 def _dt_for_math(value) -> datetime | None:
@@ -247,6 +289,171 @@ def _dt_for_math(value) -> datetime | None:
     if dt.tzinfo is not None:
         dt = dt.astimezone(_LOCAL_TZ).replace(tzinfo=None)
     return dt
+
+
+def _date_range_list(start_date: str, end_date: str) -> list[str]:
+    start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if start_obj > end_obj:
+        start_obj, end_obj = end_obj, start_obj
+    out: list[str] = []
+    cur = start_obj
+    while cur <= end_obj:
+        out.append(cur.isoformat())
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def _break_minutes_for_pauses(pauses: list[dict], entry_date: str, now_dt: datetime) -> float:
+    is_today = entry_date == _today_str()
+    break_seconds = 0
+    for p in pauses:
+        s = _dt_for_math(p.get("start"))
+        if not s:
+            continue
+        if p.get("end"):
+            e = _dt_for_math(p.get("end"))
+            if not e:
+                continue
+        else:
+            e = now_dt if is_today else s
+        if e > s:
+            break_seconds += int((e - s).total_seconds())
+    return float(break_seconds) / 60.0
+
+
+def _csv_response(rows: list[list[str]], filename: str) -> Response:
+    def gen():
+        from io import StringIO
+
+        sio = StringIO()
+        w = csv.writer(sio)
+        for row in rows:
+            sio.seek(0)
+            sio.truncate(0)
+            w.writerow(row)
+            yield sio.getvalue()
+
+    return Response(gen(), mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def _env_flag(name: str) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sqlite_restore_enabled() -> bool:
+    if _use_postgres():
+        return False
+    return _env_flag("ALLOW_DB_RESTORE")
+
+
+def _db_backup_payload() -> dict:
+    with _db() as conn:
+        entries = _fetchall(
+            conn,
+            _sql(
+                "SELECT id, entry_date::text AS entry_date, member, article, tasks_json, completed, created_at, NOW() AS exported_at FROM entries ORDER BY created_at, id",
+                "SELECT id, entry_date AS entry_date, member, article, tasks_json, completed, created_at, CURRENT_TIMESTAMP AS exported_at FROM entries ORDER BY created_at, id",
+            ),
+        )
+        member_logins = _fetchall(
+            conn,
+            _sql(
+                "SELECT id, entry_date::text AS entry_date, member, login_at, logout_at FROM member_logins ORDER BY entry_date, member",
+                "SELECT id, entry_date AS entry_date, member, login_at, logout_at FROM member_logins ORDER BY entry_date, member",
+            ),
+        )
+        member_pauses = _fetchall(
+            conn,
+            _sql(
+                "SELECT id, entry_date::text AS entry_date, member, pause_start, pause_end FROM member_pauses ORDER BY entry_date, member, pause_start",
+                "SELECT id, entry_date AS entry_date, member, pause_start, pause_end FROM member_pauses ORDER BY entry_date, member, pause_start",
+            ),
+        )
+        tasks = _fetchall(conn, "SELECT id, label, estimate, category, active FROM tasks ORDER BY category, label")
+        categories = _fetchall(conn, "SELECT name FROM task_categories ORDER BY name")
+
+    for r in entries:
+        r["created_at"] = _dt_to_iso(r.get("created_at"))
+        if "exported_at" in r:
+            r.pop("exported_at", None)
+        if isinstance(r.get("tasks_json"), str):
+            try:
+                r["tasks_json"] = json.loads(r["tasks_json"])
+            except Exception:
+                pass
+    for r in member_logins:
+        r["login_at"] = _dt_to_iso(r.get("login_at"))
+        r["logout_at"] = _dt_to_iso(r.get("logout_at"))
+    for r in member_pauses:
+        r["pause_start"] = _dt_to_iso(r.get("pause_start"))
+        r["pause_end"] = _dt_to_iso(r.get("pause_end"))
+    for r in tasks:
+        if not _use_postgres():
+            r["active"] = bool(int(r.get("active") or 0))
+
+    return {
+        "meta": {
+            "exported_at": datetime.now(_APP_TZ).isoformat(timespec="seconds"),
+            "timezone": str(_APP_TZ),
+            "db": "postgres" if _use_postgres() else "sqlite",
+        },
+        "tables": {
+            "entries": entries,
+            "member_logins": member_logins,
+            "member_pauses": member_pauses,
+            "tasks": tasks,
+            "task_categories": categories,
+        },
+    }
+
+
+def _stream_file(path: str, download_name: str) -> Response:
+    def gen():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    return Response(
+        gen(),
+        mimetype="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
+def _stream_sqlite_snapshot(download_name: str) -> Response:
+    os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
+    ensure_db()
+    stamp = datetime.now(_APP_TZ).strftime("%Y%m%d_%H%M%S")
+    snapshot_path = f"{SQLITE_PATH}.export_{stamp}"
+    with _sqlite_swap_lock:
+        shutil.copy2(SQLITE_PATH, snapshot_path)
+
+    def gen():
+        try:
+            with open(snapshot_path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.remove(snapshot_path)
+            except Exception:
+                pass
+
+    return Response(
+        gen(),
+        mimetype="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
 
 
 @contextmanager
@@ -458,6 +665,16 @@ def _admin_password() -> str | None:
     if not pw:
         return None
     return str(pw)
+
+
+_admin_login_attempts: dict[str, list[float]] = {}
+_ADMIN_LOGIN_WINDOW_SECONDS = 10 * 60.0
+_ADMIN_LOGIN_MAX_ATTEMPTS = 8
+
+
+def _admin_login_client_key() -> str:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return forwarded or (request.remote_addr or "unknown")
 
 
 def _valid_member(member: str) -> bool:
@@ -834,6 +1051,7 @@ def home():
     <script>
       const taskMeta = {{ task_meta | tojson }};
       const isEditable = {{ "true" if editable else "false" }};
+      const appTimeZone = "{{ app_timezone }}";
       let state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
 
       function selectedTasks(){ return Array.from(document.querySelectorAll(".taskBox")).filter(b=>b.checked).map(b=>b.value); }
@@ -989,9 +1207,32 @@ def home():
           (data.entries.length? `<table><thead><tr><th>Time</th><th>Article</th><th>Status</th><th>Tasks</th><th>Spent</th></tr></thead><tbody>${rows}</tbody></table>` : "<div class='muted'>No entries.</div>");
       }
       document.getElementById("loadBtn").addEventListener("click", loadReport);
+
+      function tzNow(tz){
+        const s = new Date().toLocaleString("en-US",{ timeZone: tz });
+        return new Date(s);
+      }
+      function scheduleMidnightSwitch(){
+        if(!isEditable) return;
+        const now = tzNow(appTimeZone);
+        const next = new Date(now);
+        next.setHours(24,0,0,0);
+        const wait = Math.max(1000, next.getTime() - now.getTime());
+        setTimeout(() => {
+          if(!isEditable) return;
+          const ok = confirm("It's a new day. Switch to today's date now?");
+          if(ok){
+            window.location.href = "/";
+            return;
+          }
+          setTimeout(scheduleMidnightSwitch, 5 * 60 * 1000);
+        }, wait);
+      }
+
       updateSelectionSummary();
       refreshStatus();
       refreshSave();
+      scheduleMidnightSwitch();
     </script></body></html>
     """
 
@@ -1000,6 +1241,7 @@ def home():
         selected_date=selected_date,
         today=_today_str(),
         editable=editable,
+        app_timezone=str(_APP_TZ),
         members=MEMBER_NAMES,
         categories=categories,
         tasks_by_cat=tasks_by_cat,
@@ -1252,13 +1494,26 @@ def admin_login_page():
 
 @app.post("/admin/login")
 def admin_login_post():
+    key = _admin_login_client_key()
+    now = time.time()
+    attempts = _admin_login_attempts.get(key, [])
+    attempts = [t for t in attempts if (now - t) <= _ADMIN_LOGIN_WINDOW_SECONDS]
+    if len(attempts) >= _ADMIN_LOGIN_MAX_ATTEMPTS:
+        wait_s = int(max(1.0, _ADMIN_LOGIN_WINDOW_SECONDS - (now - min(attempts))))
+        _admin_login_attempts[key] = attempts
+        return jsonify({"error": f"Too many attempts. Try again in {wait_s} seconds."}), 429
+
     payload = request.get_json(silent=True) or {}
     password = (payload.get("password") or "").strip()
     expected_password = _admin_password()
     if not expected_password:
         return jsonify({"error": "Admin is not configured. Set ADMIN_PASSWORD in environment variables."}), 503
     if password != expected_password:
+        attempts.append(now)
+        _admin_login_attempts[key] = attempts
         return jsonify({"error": "Invalid password."}), 401
+
+    _admin_login_attempts.pop(key, None)
     session["admin"] = True
     return jsonify({"ok": True})
 
@@ -1983,6 +2238,10 @@ def admin_report():
         selected_date = _today_str()
 
     is_today = selected_date == _today_str()
+    if not is_today:
+        cached = _admin_report_cache.get(selected_date)
+        if cached and (time.time() - cached[0]) < _ADMIN_REPORT_CACHE_TTL_SECONDS:
+            return cached[1]
     now_dt = datetime.now()
     grouped = {}
     member_summary = {}
@@ -2106,6 +2365,9 @@ def admin_report():
               <a class="nav-link" href="{{ url_for('admin_tasks') }}">Tasks &amp; Estimation</a>
               <a class="nav-link" href="{{ url_for('admin_efficiency') }}">Member Efficiency</a>
               <a class="nav-link" href="{{ url_for('admin_export_csv') }}?date={{ selected_date }}">Export CSV</a>
+              <a class="nav-link" href="{{ url_for('admin_export_tasks_csv') }}?date={{ selected_date }}">Export Tasks CSV</a>
+              <a class="nav-link" href="{{ url_for('admin_export_builder') }}?date={{ selected_date }}">Export Builder</a>
+              <a class="nav-link" href="{{ url_for('admin_db') }}">DB Backup</a>
               <a class="nav-link" href="{{ url_for('home') }}">Home</a>
               <button id="logout" class="secondary">Logout</button>
             </div>
@@ -2286,7 +2548,7 @@ def admin_report():
     </html>
     """
 
-    return render_template_string(
+    rendered = render_template_string(
         html,
         selected_date=selected_date,
         today=_today_str(),
@@ -2298,16 +2560,268 @@ def admin_report():
         team_break_hours=_hours_value(team_break),
         task_label_map=task_label_map,
     )
+    if not is_today:
+        _admin_report_cache[selected_date] = (time.time(), rendered)
+    return rendered
 
 
 @app.get("/admin/export.csv")
 def admin_export_csv():
     _require_admin()
+    anchor_date = request.args.get("date") or _today_str()
+    try:
+        anchor_date = _parse_date(anchor_date)
+    except Exception:
+        anchor_date = _today_str()
+
+    start_date = request.args.get("start") or anchor_date
+    end_date = request.args.get("end") or anchor_date
+    try:
+        start_date = _parse_date(start_date)
+        end_date = _parse_date(end_date)
+    except Exception:
+        start_date = anchor_date
+        end_date = anchor_date
+
+    member_filter = (request.args.get("member") or "").strip()
+    members = MEMBER_NAMES if not member_filter else ([member_filter] if member_filter in MEMBER_NAMES else MEMBER_NAMES)
+
+    allowed = [
+        "date",
+        "member",
+        "article",
+        "status",
+        "tasks",
+        "spent_total_min",
+        "spent_total_label",
+        "break_total_min",
+        "break_total_label",
+        "first_at",
+        "last_at",
+    ]
+    default_cols = list(allowed)
+    raw_cols = request.args.getlist("cols")
+    if not raw_cols:
+        raw_cols = [c.strip() for c in (request.args.get("cols") or "").split(",") if c.strip()]
+    cols = [c for c in raw_cols if c in allowed] or default_cols
+
+    output: list[list[str]] = [cols]
+    day_list = _date_range_list(start_date, end_date)
+    for d in day_list:
+        now_dt = datetime.now()
+        for member in members:
+            data = _build_member_day_entries(member, d)
+            break_min = _break_minutes_for_pauses(data["pauses"], d, now_dt)
+            for e in data["entries"]:
+                task_labels = [_task_label(str(t)) for t in e["tasks"]]
+                row = {
+                    "date": d,
+                    "member": member,
+                    "article": str(e["article"]),
+                    "status": "Completed" if bool(e["completed"]) else "In Progress",
+                    "tasks": ", ".join(task_labels),
+                    "spent_total_min": str(round(float(e["spent_total"]), 2)),
+                    "spent_total_label": str(e["spent_total_label"]),
+                    "break_total_min": str(round(float(break_min), 2)),
+                    "break_total_label": _minutes_label(break_min),
+                    "first_at": str(e["created_at_local"]),
+                    "last_at": str(e.get("last_at_local") or e["created_at_local"]),
+                }
+                output.append([row.get(c, "") for c in cols])
+
+    filename = f"team_{start_date}_to_{end_date}.csv" if start_date != end_date else f"team_{start_date}.csv"
+    return _csv_response(output, filename)
+
+
+@app.get("/admin/export_tasks.csv")
+def admin_export_tasks_csv():
+    _require_admin()
+    anchor_date = request.args.get("date") or _today_str()
+    try:
+        anchor_date = _parse_date(anchor_date)
+    except Exception:
+        anchor_date = _today_str()
+
+    start_date = request.args.get("start") or anchor_date
+    end_date = request.args.get("end") or anchor_date
+    try:
+        start_date = _parse_date(start_date)
+        end_date = _parse_date(end_date)
+    except Exception:
+        start_date = anchor_date
+        end_date = anchor_date
+
+    member_filter = (request.args.get("member") or "").strip()
+    members = MEMBER_NAMES if not member_filter else ([member_filter] if member_filter in MEMBER_NAMES else MEMBER_NAMES)
+
+    allowed = [
+        "date",
+        "member",
+        "article",
+        "task_id",
+        "task",
+        "task_spent_min",
+        "task_spent_label",
+        "status",
+        "break_total_min",
+        "break_total_label",
+        "first_at",
+        "last_at",
+    ]
+    default_cols = list(allowed)
+    raw_cols = request.args.getlist("cols")
+    if not raw_cols:
+        raw_cols = [c.strip() for c in (request.args.get("cols") or "").split(",") if c.strip()]
+    cols = [c for c in raw_cols if c in allowed] or default_cols
+
+    output: list[list[str]] = [cols]
+    day_list = _date_range_list(start_date, end_date)
+    for d in day_list:
+        now_dt = datetime.now()
+        for member in members:
+            data = _build_member_day_entries(member, d)
+            break_min = _break_minutes_for_pauses(data["pauses"], d, now_dt)
+            for e in data["entries"]:
+                spent_map = e.get("task_spent") or {}
+                for tid in e.get("tasks") or []:
+                    task_id = str(tid)
+                    tmin = float(spent_map.get(task_id, 0.0))
+                    row = {
+                        "date": d,
+                        "member": member,
+                        "article": str(e["article"]),
+                        "task_id": task_id,
+                        "task": _task_label(task_id),
+                        "task_spent_min": str(round(float(tmin), 2)),
+                        "task_spent_label": _minutes_label(tmin),
+                        "status": "Completed" if bool(e["completed"]) else "In Progress",
+                        "break_total_min": str(round(float(break_min), 2)),
+                        "break_total_label": _minutes_label(break_min),
+                        "first_at": str(e["created_at_local"]),
+                        "last_at": str(e.get("last_at_local") or e["created_at_local"]),
+                    }
+                    output.append([row.get(c, "") for c in cols])
+
+    filename = f"tasks_{start_date}_to_{end_date}.csv" if start_date != end_date else f"tasks_{start_date}.csv"
+    return _csv_response(output, filename)
+
+
+@app.get("/admin/export")
+def admin_export_builder():
+    _require_admin()
     selected_date = request.args.get("date") or _today_str()
-    selected_date = _parse_date(selected_date)
-    now_dt = datetime.now()
-    output = [
-        [
+    try:
+        selected_date = _parse_date(selected_date)
+    except Exception:
+        selected_date = _today_str()
+
+    html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Export Builder</title>
+        <style>
+          * { box-sizing: border-box; }
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 22px 14px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
+          .wrap { max-width: 1100px; margin: 0 auto; }
+          .top { display:flex; justify-content: space-between; align-items: center; gap:10px; flex-wrap: wrap; }
+          .card { border: 1px solid #dbe3ee; border-radius: 16px; padding: 16px; margin-top: 12px; background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05); }
+          .muted { color: #64748b; font-size: 12px; line-height: 1.55; }
+          form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+          label { display:block; font-size: 12px; font-weight: 700; color: #334155; margin-bottom: 6px; }
+          input, select { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 12px; font-size: 14px; outline: none; }
+          input:focus, select:focus { border-color: #86cfc5; box-shadow: 0 0 0 4px rgba(15,118,110,.12); }
+          .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+          .cols { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+          .col { display:flex; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fbfdff; }
+          button { padding: 11px 14px; border: none; border-radius: 12px; cursor: pointer; background: linear-gradient(135deg, #0f766e, #115e59); color: #fff; font-size: 14px; font-weight: 800; }
+          a { background: #e2e8f0; color: #0f172a; text-decoration: none; border-radius: 12px; padding: 10px 12px; font-weight: 700; border: 1px solid #cbd5e1; display: inline-block; }
+          @media (max-width: 860px) { form { grid-template-columns: 1fr; } .cols { grid-template-columns: 1fr; } }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="top">
+            <div>
+              <h1 style="font-size: 20px; margin: 0;">Export Builder</h1>
+              <div class="muted">Build a CSV export for Excel: pick date range, member, export type, and columns.</div>
+            </div>
+            <div class="row">
+              <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
+              <a href="{{ url_for('home') }}">Home</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <form method="GET" action="{{ url_for('admin_export_download') }}">
+              <div>
+                <label>Start date</label>
+                <input type="date" name="start" value="{{ selected_date }}" max="{{ today }}" />
+              </div>
+              <div>
+                <label>End date</label>
+                <input type="date" name="end" value="{{ selected_date }}" max="{{ today }}" />
+              </div>
+              <div>
+                <label>Member</label>
+                <select name="member">
+                  <option value="">All members</option>
+                  {% for m in members %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+                </select>
+              </div>
+              <div>
+                <label>Export type</label>
+                <select name="type" id="type">
+                  <option value="summary">Summary (per article)</option>
+                  <option value="tasks">Tasks (one row per task)</option>
+                </select>
+              </div>
+
+              <div style="grid-column: 1 / -1;">
+                <label>Columns</label>
+                <div class="muted">Choose the columns you want. If you leave everything unchecked, the export includes all default columns.</div>
+                <div class="cols" id="summaryCols">
+                  {% for c in summary_cols %}
+                    <label class="col"><input type="checkbox" name="cols" value="{{ c }}" checked /> <span>{{ c }}</span></label>
+                  {% endfor %}
+                </div>
+                <div class="cols" id="taskCols" style="display:none;">
+                  {% for c in task_cols %}
+                    <label class="col"><input type="checkbox" name="task_cols_sel" value="{{ c }}" checked /> <span>{{ c }}</span></label>
+                  {% endfor %}
+                </div>
+              </div>
+
+              <div style="grid-column: 1 / -1; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                <button type="submit">Download CSV</button>
+                <div class="muted">Tip: Excel can open CSV directly.</div>
+              </div>
+            </form>
+          </div>
+        </div>
+        <script>
+          const typeSel = document.getElementById("type");
+          const summaryCols = document.getElementById("summaryCols");
+          const taskCols = document.getElementById("taskCols");
+          function sync(){
+            const t = typeSel.value;
+            summaryCols.style.display = (t === "summary") ? "" : "none";
+            taskCols.style.display = (t === "tasks") ? "" : "none";
+          }
+          typeSel.addEventListener("change", sync);
+          sync();
+        </script>
+      </body>
+    </html>
+    """
+    return render_template_string(
+        html,
+        selected_date=selected_date,
+        today=_today_str(),
+        members=MEMBER_NAMES,
+        summary_cols=[
             "date",
             "member",
             "article",
@@ -2319,54 +2833,182 @@ def admin_export_csv():
             "break_total_label",
             "first_at",
             "last_at",
-        ]
-    ]
-    for member in MEMBER_NAMES:
-        data = _build_member_day_entries(member, selected_date)
-        break_seconds = 0
-        for p in data["pauses"]:
-            s = _dt_for_math(p.get("start"))
-            if not s:
-                continue
-            if p.get("end"):
-                e = _dt_for_math(p.get("end"))
-                if not e:
-                    continue
-            else:
-                e = now_dt if selected_date == _today_str() else s
-            if e > s:
-                break_seconds += int((e - s).total_seconds())
-        break_min = float(break_seconds) / 60.0
+        ],
+        task_cols=[
+            "date",
+            "member",
+            "article",
+            "task_id",
+            "task",
+            "task_spent_min",
+            "task_spent_label",
+            "status",
+            "break_total_min",
+            "break_total_label",
+            "first_at",
+            "last_at",
+        ],
+    )
 
-        for e in data["entries"]:
-            task_labels = [_task_label(str(t)) for t in e["tasks"]]
-            output.append(
-                [
-                    selected_date,
-                    member,
-                    e["article"],
-                    "Completed" if bool(e["completed"]) else "In Progress",
-                    ", ".join(task_labels),
-                    str(round(float(e["spent_total"]), 2)),
-                    e["spent_total_label"],
-                    str(round(float(break_min), 2)),
-                    _minutes_label(break_min),
-                    e["created_at_local"],
-                    e.get("last_at_local") or e["created_at_local"],
-                ]
-            )
 
-    def gen():
-        from io import StringIO
-        sio = StringIO()
-        w = csv.writer(sio)
-        for row in output:
-            sio.seek(0)
-            sio.truncate(0)
-            w.writerow(row)
-            yield sio.getvalue()
+@app.get("/admin/export/download.csv")
+def admin_export_download():
+    _require_admin()
+    export_type = (request.args.get("type") or "summary").strip().lower()
+    start_date = request.args.get("start") or _today_str()
+    end_date = request.args.get("end") or start_date
+    member = (request.args.get("member") or "").strip()
 
-    return Response(gen(), mimetype="text/csv", headers={"Content-Disposition": f'attachment; filename="team_{selected_date}.csv"'})
+    if export_type == "tasks":
+        cols = request.args.getlist("task_cols_sel")
+        if not cols:
+            cols = request.args.getlist("cols")
+        args = {"start": start_date, "end": end_date, "member": member}
+        if cols:
+            args["cols"] = ",".join(cols)
+        return redirect(url_for("admin_export_tasks_csv", **{k: v for k, v in args.items() if v}))
+
+    cols = request.args.getlist("cols")
+    args = {"start": start_date, "end": end_date, "member": member}
+    if cols:
+        args["cols"] = ",".join(cols)
+    return redirect(url_for("admin_export_csv", **{k: v for k, v in args.items() if v}))
+
+
+@app.get("/admin/db")
+def admin_db():
+    _require_admin()
+    mode = "Postgres" if _use_postgres() else "SQLite"
+    restore_enabled = _sqlite_restore_enabled()
+    html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Database Backup</title>
+        <style>
+          * { box-sizing: border-box; }
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 22px 14px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
+          .wrap { max-width: 980px; margin: 0 auto; }
+          .top { display:flex; justify-content: space-between; align-items: center; gap:10px; flex-wrap: wrap; }
+          .card { border: 1px solid #dbe3ee; border-radius: 16px; padding: 16px; margin-top: 12px; background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05); }
+          .muted { color: #64748b; font-size: 12px; line-height: 1.55; }
+          .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+          a.btn { background: linear-gradient(135deg, #0f766e, #115e59); color: #fff; text-decoration: none; border-radius: 12px; padding: 10px 12px; font-weight: 800; border: 0; display: inline-block; }
+          a.btn.secondary { background: #e2e8f0; color: #0f172a; border: 1px solid #cbd5e1; font-weight: 700; }
+          input[type=file] { width: 100%; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 12px; font-size: 14px; background: #fff; }
+          button { padding: 10px 12px; border: none; border-radius: 12px; cursor: pointer; background: linear-gradient(135deg, #0f766e, #115e59); color: #fff; font-size: 14px; font-weight: 800; }
+          .pill { display:inline-flex; gap:8px; align-items:center; padding: 8px 12px; border-radius: 999px; border: 1px solid #e2e8f0; background: #fbfdff; font-weight: 800; font-size: 12px; }
+          .warn { border-color: #f4d28a; background: #fff7e8; color: #8a5a02; }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="top">
+            <div>
+              <h1 style="font-size: 20px; margin: 0;">Database Backup</h1>
+              <div class="muted">Export a master backup. Optional restore is available only when explicitly enabled for local mode.</div>
+            </div>
+            <div class="row">
+              <a class="btn secondary" href="{{ url_for('admin_report') }}">Back To Admin Report</a>
+              <a class="btn secondary" href="{{ url_for('home') }}">Home</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row" style="justify-content: space-between;">
+              <div class="pill">DB Mode: {{ mode }}</div>
+              <div class="pill">Timezone: {{ timezone }}</div>
+            </div>
+            <div class="muted" style="margin-top: 10px;">
+              For local shared-folder mode, set SQLITE_PATH to a shared folder and run the app. Then you can import/restore the master DB file if enabled.
+            </div>
+            <div class="row" style="margin-top: 12px;">
+              <a class="btn" href="{{ url_for('admin_db_export') }}">Download Master Backup</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row" style="justify-content: space-between;">
+              <div class="pill {% if not restore_enabled %}warn{% endif %}">Restore: {{ "Enabled" if restore_enabled else "Disabled" }}</div>
+              <div class="muted">Env flag required: ALLOW_DB_RESTORE=1 (SQLite only)</div>
+            </div>
+            {% if restore_enabled %}
+              <form method="POST" action="{{ url_for('admin_db_restore') }}" enctype="multipart/form-data" style="margin-top: 12px;">
+                <div class="muted">Upload a SQLite master database file. The app creates a timestamped backup of the current DB before swapping.</div>
+                <div style="margin-top: 10px;">
+                  <input type="file" name="db" accept=".sqlite3,.db,application/octet-stream" required />
+                </div>
+                <div class="row" style="margin-top: 10px;">
+                  <button type="submit">Restore / Switch DB</button>
+                </div>
+              </form>
+            {% else %}
+              <div class="muted" style="margin-top: 12px;">Restore is disabled by default to prevent accidental data loss in production.</div>
+            {% endif %}
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return render_template_string(html, mode=mode, timezone=str(_APP_TZ), restore_enabled=restore_enabled)
+
+
+@app.get("/admin/db/export")
+def admin_db_export():
+    _require_admin()
+    if not _use_postgres():
+        return _stream_sqlite_snapshot("master.sqlite3")
+    payload = _db_backup_payload()
+    stamp = datetime.now(_APP_TZ).strftime("%Y%m%d_%H%M%S")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return Response(
+        data,
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="backup_{stamp}.json"'},
+    )
+
+
+@app.post("/admin/db/restore")
+def admin_db_restore():
+    _require_admin()
+    if not _sqlite_restore_enabled():
+        return jsonify({"error": "Restore is disabled."}), 403
+    uploaded = request.files.get("db")
+    if not uploaded:
+        return jsonify({"error": "Missing file."}), 400
+    os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
+    stamp = datetime.now(_APP_TZ).strftime("%Y%m%d_%H%M%S")
+    upload_path = f"{SQLITE_PATH}.upload_{stamp}"
+    uploaded.save(upload_path)
+    try:
+        with open(upload_path, "rb") as f:
+            head = f.read(16)
+        if not head.startswith(b"SQLite format 3\x00"):
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
+            return jsonify({"error": "Invalid SQLite database file."}), 400
+
+        backup_path = f"{SQLITE_PATH}.bak_{stamp}"
+        with _sqlite_swap_lock:
+            if os.path.exists(SQLITE_PATH):
+                shutil.copy2(SQLITE_PATH, backup_path)
+            os.replace(upload_path, SQLITE_PATH)
+            _task_cache.clear()
+            _admin_report_cache.clear()
+            global _db_initialized
+            _db_initialized = False
+    finally:
+        try:
+            if os.path.exists(upload_path):
+                os.remove(upload_path)
+        except Exception:
+            pass
+
+    return redirect(url_for("admin_db"))
 
 
 @app.errorhandler(401)
