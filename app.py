@@ -980,6 +980,16 @@ def home():
     )
 
 
+@app.get("/status")
+def status():
+    """Simple status check that doesn't require database."""
+    return jsonify({
+        "status": "running",
+        "service": "Daily Report Tool",
+        "db_configured": bool(DATABASE_URL),
+        "db_initialized": _db_initialized,
+    })
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -2330,8 +2340,14 @@ def init():
     with _db_init_lock:
         if _db_initialized:
             return
-        _init_db()
-        _db_initialized = True
+        try:
+            _init_db()
+            _db_initialized = True
+        except Exception as e:
+            # Log but don't crash - database will retry on next request
+            import sys
+            print(f"[WARNING] Database initialization failed: {e}", file=sys.stderr)
+            pass
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
