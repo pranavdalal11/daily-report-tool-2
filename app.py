@@ -229,6 +229,26 @@ def _dt_to_iso(value) -> str | None:
     return str(value)
 
 
+_LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def _dt_for_math(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_LOCAL_TZ).replace(tzinfo=None)
+    return dt
+
+
 @contextmanager
 def _db():
     if _use_postgres():
@@ -535,9 +555,13 @@ def _pause_state_for_member(member: str, entry_date: str) -> dict:
     closed_seconds = 0
     open_start = None
     for p in pauses:
-        s = datetime.fromisoformat(str(p["start"]))
+        s = _dt_for_math(p.get("start"))
+        if not s:
+            continue
         if p.get("end"):
-            e = datetime.fromisoformat(str(p["end"]))
+            e = _dt_for_math(p.get("end"))
+            if not e:
+                continue
             if e > s:
                 closed_seconds += int((e - s).total_seconds())
         else:
@@ -627,16 +651,21 @@ def _build_member_day_entries(member: str, entry_date: str) -> dict:
         if not st["completed"]:
             row["completed"] = False
 
-    login_dt = datetime.fromisoformat(login_at) if login_at else None
-    logout_dt = datetime.fromisoformat(logout_at) if logout_at else None
+    login_dt = _dt_for_math(login_at) if login_at else None
+    logout_dt = _dt_for_math(logout_at) if logout_at else None
 
     def paused_seconds_until(until_at: datetime) -> int:
         if not login_dt:
             return 0
+        until_at = _dt_for_math(until_at) or until_at
         total = 0
         for p in pauses:
-            s = datetime.fromisoformat(str(p["start"]))
-            e = datetime.fromisoformat(str(p["end"])) if p.get("end") else until_at
+            s = _dt_for_math(p.get("start"))
+            if not s:
+                continue
+            e = _dt_for_math(p.get("end")) if p.get("end") else until_at
+            if not e:
+                continue
             e2 = min(e, until_at)
             start = max(login_dt, s)
             if e2 > start:
@@ -646,7 +675,7 @@ def _build_member_day_entries(member: str, entry_date: str) -> dict:
     entries = []
     total_productive = 0.0
     for a in by_article.values():
-        effective_last = a["last_at"]
+        effective_last = _dt_for_math(a["last_at"]) or a["last_at"]
         if logout_dt and logout_dt < effective_last:
             effective_last = logout_dt
         overtime = False
@@ -1140,9 +1169,13 @@ def report():
     break_seconds = 0
     now_dt = datetime.now()
     for p in pauses:
-        s = datetime.fromisoformat(str(p["start"]))
+        s = _dt_for_math(p.get("start"))
+        if not s:
+            continue
         if p.get("end"):
-            e = datetime.fromisoformat(str(p["end"]))
+            e = _dt_for_math(p.get("end"))
+            if not e:
+                continue
         else:
             e = now_dt if requested_date == _today_str() else s
         if e > s:
@@ -1324,9 +1357,13 @@ def admin_search():
 
             break_seconds = 0
             for p in data["pauses"]:
-                s = datetime.fromisoformat(str(p["start"]))
+                s = _dt_for_math(p.get("start"))
+                if not s:
+                    continue
                 if p.get("end"):
-                    e = datetime.fromisoformat(str(p["end"]))
+                    e = _dt_for_math(p.get("end"))
+                    if not e:
+                        continue
                 else:
                     e = now_dt if entry_date == _today_str() else s
                 if e > s:
@@ -1709,9 +1746,13 @@ def admin_efficiency():
             now_dt = datetime.now()
             pause_seconds = 0
             for p in pauses:
-                s = datetime.fromisoformat(str(p["start"]))
+                s = _dt_for_math(p.get("start"))
+                if not s:
+                    continue
                 if p.get("end"):
-                    e = datetime.fromisoformat(str(p["end"]))
+                    e = _dt_for_math(p.get("end"))
+                    if not e:
+                        continue
                 else:
                     e = now_dt if d == _today_str() else s
                 if e > s:
@@ -1955,9 +1996,13 @@ def admin_report():
         pauses = data["pauses"]
         break_seconds = 0
         for p in pauses:
-            s = datetime.fromisoformat(str(p["start"]))
+            s = _dt_for_math(p.get("start"))
+            if not s:
+                continue
             if p.get("end"):
-                e = datetime.fromisoformat(str(p["end"]))
+                e = _dt_for_math(p.get("end"))
+                if not e:
+                    continue
             else:
                 e = now_dt if is_today else s
             if e > s:
@@ -1970,13 +2015,16 @@ def admin_report():
 
         current_timer = "-"
         if login_at and is_today:
-            login_dt = datetime.fromisoformat(login_at)
-            end_dt = datetime.fromisoformat(logout_at) if logout_at else now_dt
-            productive_sec = max(0, int((end_dt - login_dt).total_seconds()) - break_seconds)
-            hh = productive_sec // 3600
-            mm = (productive_sec % 3600) // 60
-            ss = productive_sec % 60
-            current_timer = f"{hh:02d}:{mm:02d}:{ss:02d}"
+            login_dt = _dt_for_math(login_at)
+            end_dt = _dt_for_math(logout_at) if logout_at else now_dt
+            if not login_dt or not end_dt:
+                current_timer = "-"
+            else:
+                productive_sec = max(0, int((end_dt - login_dt).total_seconds()) - break_seconds)
+                hh = productive_sec // 3600
+                mm = (productive_sec % 3600) // 60
+                ss = productive_sec % 60
+                current_timer = f"{hh:02d}:{mm:02d}:{ss:02d}"
 
         free_min = max(0.0, float(WORKDAY_MINUTES) - used_min - break_min) if login_at else None
 
@@ -2277,9 +2325,13 @@ def admin_export_csv():
         data = _build_member_day_entries(member, selected_date)
         break_seconds = 0
         for p in data["pauses"]:
-            s = datetime.fromisoformat(str(p["start"]))
+            s = _dt_for_math(p.get("start"))
+            if not s:
+                continue
             if p.get("end"):
-                e = datetime.fromisoformat(str(p["end"]))
+                e = _dt_for_math(p.get("end"))
+                if not e:
+                    continue
             else:
                 e = now_dt if selected_date == _today_str() else s
             if e > s:
