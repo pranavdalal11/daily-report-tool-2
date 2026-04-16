@@ -2333,8 +2333,6 @@ def init():
         _init_db()
         _db_initialized = True
 
-_init_db_startup()
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = (os.environ.get("FLASK_DEBUG") or "").strip() in {"1", "true", "True"}
