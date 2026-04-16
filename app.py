@@ -3,28 +3,24 @@ import json
 import os
 import secrets
 import sqlite3
+import socket
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from urllib.parse import parse_qs, unquote, urlparse
 
 from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import atexit
-import psycopg2
-import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
 
 @atexit.register
 def close_pool():
     global _pool
-    try:
-        if _pool:
-            _pool.closeall()
-    except Exception:
-        pass
+    if _pool:
+        _pool.closeall()
 
 
 
@@ -84,33 +80,15 @@ LEGACY_TASKS = {
 
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SQLITE_PATH = os.environ.get("SQLITE_PATH") or os.path.join(os.path.dirname(__file__), "server_data", "master.sqlite3")
-SECRET_KEY = os.environ.get("SECRET_KEY")
-if not SECRET_KEY:
-    if DATABASE_URL:
-        raise RuntimeError("SECRET_KEY must be set when DATABASE_URL is configured for production.")
-    SECRET_KEY = secrets.token_hex(32)
-app.secret_key = SECRET_KEY
+
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    PREFERRED_URL_SCHEME="https",
 )
-if os.environ.get("SESSION_COOKIE_SECURE") is not None:
-    app.config["SESSION_COOKIE_SECURE"] = str(os.environ.get("SESSION_COOKIE_SECURE")).lower() in {"1", "true", "yes"}
-elif os.environ.get("FLASK_ENV", "").lower() == "production" or DATABASE_URL:
-    app.config["SESSION_COOKIE_SECURE"] = True
-
-def ensure_db():
-    global _db_initialized
-    if not _db_initialized:
-        with _db_init_lock:
-            if not _db_initialized:
-                _init_db()
-                _db_initialized = True
-
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 if os.environ.get("RENDER"):
     app.config["SESSION_COOKIE_SECURE"] = True
 
@@ -126,21 +104,52 @@ _db_init_lock = threading.Lock()
 def _pg():
     try:
         import psycopg2
+        import psycopg2.extras
+        import psycopg2.pool
         return psycopg2
     except ModuleNotFoundError as e:
-        raise RuntimeError("psycopg2 not installed") from e
+        raise RuntimeError("psycopg2 is not installed. Run: pip install -r requirements.txt") from e
 
 def _use_postgres() -> bool:
     return bool(DATABASE_URL) and str(DATABASE_URL).startswith(("postgres://", "postgresql://"))
 
+def _resolve_ipv4(host: str) -> str | None:
+    try:
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    if not infos:
+        return None
+    return str(infos[0][4][0])
 
-def _pg_connect_args() -> dict[str, str]:
-    sslmode = os.environ.get("PGSSLMODE") or os.environ.get("SSL_MODE") or os.environ.get("SSLMODE")
+def _pg_kwargs_from_url(url: str) -> dict:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
+        raise ValueError("Invalid postgres DATABASE_URL")
+    qs = parse_qs(parsed.query)
+    sslmode = (qs.get("sslmode") or [None])[0] or os.environ.get("PGSSLMODE") or None
+    kwargs: dict = {
+        "host": parsed.hostname,
+        "port": int(parsed.port or 5432),
+        "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
     if sslmode:
-        return {"sslmode": sslmode}
-    if DATABASE_URL and "sslmode=" not in DATABASE_URL.lower():
-        return {"sslmode": "require"}
-    return {}
+        kwargs["sslmode"] = sslmode
+    dbname = (parsed.path or "").lstrip("/")
+    if dbname:
+        kwargs["dbname"] = dbname
+    if parsed.username is not None:
+        kwargs["user"] = unquote(parsed.username)
+    if parsed.password is not None:
+        kwargs["password"] = unquote(parsed.password)
+    hostaddr = _resolve_ipv4(parsed.hostname)
+    if hostaddr:
+        kwargs["hostaddr"] = hostaddr
+    return kwargs
 
 def _adapt_sqlite_sql(sql: str) -> str:
     return (
@@ -165,12 +174,24 @@ def _get_pool():
         return _pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
-    _pool = ThreadedConnectionPool(
-        1,
-        int(os.environ.get("DB_POOL_MAX", "10")),
-        DATABASE_URL,
-        sslmode="require"
-    )
+    pg = _pg()
+    maxconn = int(os.environ.get("DB_POOL_MAX", "10"))
+    try:
+        kwargs = _pg_kwargs_from_url(DATABASE_URL)
+        if "sslmode" not in kwargs and "sslmode=" not in DATABASE_URL.lower():
+            kwargs["sslmode"] = "require"
+        _pool = pg.pool.ThreadedConnectionPool(1, maxconn, **kwargs)
+    except Exception:
+        _pool = pg.pool.ThreadedConnectionPool(
+            1,
+            maxconn,
+            DATABASE_URL,
+            connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
     return _pool
 
 
@@ -234,7 +255,6 @@ def _db():
     if _use_postgres():
         pool = _get_pool()
         conn = pool.getconn()
-        conn.row_factory = _pg().rows.dict_row
         try:
             yield conn
             conn.commit()
@@ -260,7 +280,7 @@ def _db():
 
 def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
     if _use_postgres():
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=_pg().extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
             row = cur.fetchone()
     else:
@@ -272,7 +292,7 @@ def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
 
 def _fetchall(conn, sql: str, params: tuple | None = None) -> list[dict]:
     if _use_postgres():
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=_pg().extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
             rows = cur.fetchall()
     else:
@@ -695,86 +715,54 @@ def home():
     <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>Daily Tool</title>
     <style>
-      :root{--bg-a:#fff8ea;--bg-b:#ecf5f4;--bg-c:#e8eef8;--panel:rgba(255,255,255,.92);--line:#d7e0ea;--text:#182133;--muted:#607086;--primary:#0f766e;--primary-strong:#115e59;--primary-soft:#e8f7f5;--accent:#f59e0b;--danger:#b42318;--shadow:0 22px 50px rgba(24,33,51,.1)}
-      *{box-sizing:border-box}
-      body{font-family:"Trebuchet MS","Segoe UI",sans-serif;margin:0;padding:20px;background:radial-gradient(circle at top left,var(--bg-a) 0,#f8f1e7 22%,var(--bg-b) 58%,var(--bg-c) 100%);color:var(--text);min-height:100vh}
-      .wrap{max-width:1280px;margin:0 auto}
-      a{text-decoration:none}
-      .top{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
-      .hero-card{padding:26px;border:1px solid rgba(255,255,255,.58);border-radius:26px;background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(255,255,255,.68));box-shadow:var(--shadow);backdrop-filter:blur(10px)}
-      .hero-copy{max-width:760px}
-      .eyebrow{font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--primary);margin-bottom:10px}
-      .hero-badges{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
-      .date-chip{display:inline-flex;align-items:center;padding:9px 14px;border-radius:999px;background:rgba(255,255,255,.86);border:1px solid var(--line);font-size:12px;font-weight:700}
-      .date-chip.warn{background:#fff5de;border-color:#f4d28a;color:#8a5a02}
-      .nav-btn{display:inline-flex;align-items:center;justify-content:center;padding:12px 16px;border-radius:14px;background:rgba(255,255,255,.86);border:1px solid var(--line);color:var(--text);font-weight:700}
-      .card{background:var(--panel);border:1px solid rgba(255,255,255,.66);border-radius:24px;padding:22px;margin-top:16px;box-shadow:var(--shadow);backdrop-filter:blur(10px)}
-      .grid{display:grid;grid-template-columns:1.35fr .85fr;gap:18px}
-      .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:end}
-      .report-panel{margin-top:12px;padding:18px;border-radius:22px;background:rgba(255,255,255,.86);border:1px solid rgba(255,255,255,.9);min-height:200px}
-      .field{display:flex;flex-direction:column}
-      label:not(.task){font-size:12px;font-weight:700;color:var(--muted);display:block;margin:14px 0 8px;letter-spacing:.06em;text-transform:uppercase}
-      input,select{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.96);font-size:14px;color:var(--text);outline:none}
-      input:focus,select:focus{border-color:#86cfc5;box-shadow:0 0 0 4px rgba(15,118,110,.12)}
-      button{padding:12px 16px;border:none;border-radius:14px;background:linear-gradient(135deg,var(--primary),var(--primary-strong));color:#fff;font-weight:700;cursor:pointer;box-shadow:0 18px 32px rgba(15,118,110,.24);transition:transform .18s ease,box-shadow .18s ease,background .18s ease}
-      button:hover,.nav-btn:hover{transform:translateY(-1px)}
-      button.secondary{background:rgba(255,255,255,.88);border:1px solid var(--line);color:var(--text);box-shadow:none}
-      button:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
-      .btn-active{background:linear-gradient(135deg,var(--primary),var(--primary-strong))!important;color:#fff!important;box-shadow:0 18px 32px rgba(15,118,110,.24)!important}
+      body{font-family:system-ui,Segoe UI,Arial;margin:0;padding:18px;background:#f6f8fc;color:#0f172a}
+      .wrap{max-width:1200px;margin:0 auto}
+      .top{display:flex;justify-content:space-between;align-items:center;gap:10px}
+      .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-top:12px}
+      .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+      label:not(.task){font-size:12px;font-weight:700;color:#334155;display:block;margin:10px 0 6px}
+      input,select{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px}
+      button{padding:10px 12px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+      button.secondary{background:#e2e8f0;color:#0f172a}
+      button:disabled{opacity:.5;cursor:not-allowed}
+      .btn-active{background:#2563eb!important;color:#fff!important;box-shadow:0 0 0 2px rgba(59,130,246,.2)}
       .btn-faded{opacity:.45}
-      .muted{color:var(--muted);font-size:12px;line-height:1.55}
-      .section-copy{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.55}
-      .status-box{margin-top:14px;padding:16px 18px;border-radius:18px;background:linear-gradient(135deg,#17324a,#214c61);color:#f7fbff;font-size:14px}
-      .summary-chip{display:inline-flex;align-items:center;margin-top:14px;padding:10px 14px;border-radius:999px;background:var(--primary-soft);border:1px solid #c8ece8;color:var(--text);font-size:12px;font-weight:700}
-      .tasks{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
-      .cat{border:1px solid var(--line);border-radius:22px;padding:18px;background:rgba(255,255,255,.78)}
-      .cat h3{margin:0 0 6px;font-size:16px}
-      .task{display:flex;gap:12px;align-items:flex-start;border-top:1px dashed #dde6ee;padding:12px 0;margin:0}
-      .task input[type=checkbox]{width:18px;height:18px;margin:3px 0 0;flex:0 0 auto;accent-color:var(--primary)}
-      .task .task-text{flex:1;line-height:1.45}
+      .muted{color:#64748b;font-size:12px}
+      .tasks{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:10px}
+      .cat{border:1px solid #eef2f7;border-radius:12px;padding:10px;background:#fbfdff}
+      .cat h3{margin:0 0 6px;font-size:13px}
+      .task{display:flex;gap:10px;align-items:flex-start;border-top:1px dashed #edf2f7;padding:6px 0;margin:0}
+      .task input[type=checkbox]{width:16px;height:16px;margin:2px 0 0;flex:0 0 auto}
+      .task .task-text{flex:1;line-height:1.25}
       .task:first-of-type{border-top:0}
-      .badge{font-size:11px;border:1px solid #f4d28a;background:#fff7e8;color:#8a5a02;border-radius:999px;padding:5px 10px;white-space:nowrap;flex:0 0 auto;font-weight:700}
-      .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
-      #err{margin-top:14px;padding:12px 14px;border-radius:16px;background:rgba(255,255,255,.84);border:1px solid transparent;color:var(--muted);min-height:48px;font-size:13px}
-      #err.error{color:var(--danger);background:#fff1f0;border-color:#f4c7c3}
-      .empty-report{padding:28px 18px;border-radius:20px;border:1px dashed var(--line);background:rgba(255,255,255,.62);text-align:center;color:var(--muted);font-size:14px;line-height:1.6;margin-top:14px}
-      table{width:100%;border-collapse:collapse;margin-top:12px}
-      th,td{border-bottom:1px solid #e8edf3;padding:10px 8px;font-size:13px;text-align:left;vertical-align:top}
-      th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
-      @media (max-width:980px){.grid{grid-template-columns:1fr}.top{align-items:flex-start}.hero-card,.card{padding:18px}}
+      .badge{font-size:11px;border:1px solid #bfdbfe;background:#eff6ff;color:#1e3a8a;border-radius:999px;padding:2px 8px;white-space:nowrap;flex:0 0 auto}
+      .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+      table{width:100%;border-collapse:collapse;margin-top:10px}
+      th,td{border-bottom:1px solid #edf2f7;padding:8px 6px;font-size:13px;text-align:left}
+      th{background:#f8fafc;font-size:12px}
+      @media (max-width:980px){.grid{grid-template-columns:1fr}}
     </style></head><body><div class="wrap">
-      <div class="top hero-card">
-        <div class="hero-copy">
-          <div class="eyebrow">Production Tracking Workspace</div>
-          <h2 style="margin:0;font-size:clamp(28px,4vw,42px);line-height:1.05">Daily Report Tool</h2>
-          <div class="section-copy">Track live work, manage shift actions, and review one-day output from one cleaner dashboard.</div>
-          <div class="hero-badges">
-            <span class="date-chip">Date {{ selected_date }}</span>
-            <span class="date-chip">{{ members|length }} Members</span>
-            {% if not editable %}<span class="date-chip warn">Read Only View</span>{% endif %}
-          </div>
-        </div>
-        <div><a href="{{ url_for('admin_login_page') }}" class="nav-btn">Open Admin</a></div>
+      <div class="top">
+        <div><h2 style="margin:0">Daily Report Tool</h2><div class="muted">Date: <b>{{ selected_date }}</b>{% if not editable %} (View){% endif %}</div></div>
+        <div><a href="{{ url_for('admin_login_page') }}" class="muted">Admin</a></div>
       </div>
       <div class="grid">
         <div class="card">
-          <h3 style="margin:0 0 8px">Daily Workboard</h3>
-          <div class="section-copy">Record work entries for the day with clearer shift controls and grouped task estimates.</div>
-          <div class="form-grid">
-            <div class="field"><label>Member</label><select id="member"><option value="">Select</option>{% for m in members %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></div>
-            <div class="field"><label>Today</label><input id="today" value="{{ today }}" readonly></div>
+          <h3 style="margin:0 0 8px">Add Today’s Data</h3>
+          <div class="grid">
+            <div><label>Member</label><select id="member"><option value="">Select</option>{% for m in members %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></div>
+            <div><label>Today</label><input id="today" value="{{ today }}" readonly></div>
           </div>
           <div class="actions">
             <button id="loginBtn" class="secondary" {% if not editable %}disabled{% endif %}>Login</button>
             <button id="pauseBtn" class="secondary" {% if not editable %}disabled{% endif %}>Pause</button>
             <button id="resumeBtn" class="secondary" {% if not editable %}disabled{% endif %}>Resume</button>
             <button id="logoutBtn" class="secondary" {% if not editable %}disabled{% endif %}>Logout</button>
+            <div id="status" class="muted">Select member and login.</div>
           </div>
-          <div id="status" class="status-box muted">Select member and login.</div>
           <label>Article Number</label><input id="article" placeholder="Enter article">
           <div class="task" style="border-top:0"><input id="completed" type="checkbox" checked><div class="task-text">Task Completed</div><div class="badge">Unchecked = In Progress</div></div>
           <div class="muted" style="margin-top:10px">Tasks</div>
-          <div id="selectionSummary" class="summary-chip">No tasks selected</div>
           <div class="tasks">
             {% for cat in categories %}
               <div class="cat"><h3>{{ cat }}</h3>
@@ -793,44 +781,19 @@ def home():
 
         <div class="card">
           <h3 style="margin:0 0 8px">Member Report (One Day)</h3>
-          <div class="section-copy">Load a one-day snapshot with entries, tasks, time spent, and article coverage.</div>
-          <div class="form-grid">
-            <div class="field"><label>Report Date</label><input id="reportDate" type="date" max="{{ today }}" value="{{ selected_date }}"></div>
-            <div class="field"><label>Member</label><select id="reportMember"><option value="">Select</option>{% for m in members %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select></div>
-          </div>
+          <label>Report Date</label><input id="reportDate" type="date" max="{{ today }}" value="{{ selected_date }}">
+          <label>Member</label><select id="reportMember"><option value="">Select</option>{% for m in members %}<option value="{{ m }}">{{ m }}</option>{% endfor %}</select>
           <div class="actions"><button id="loadBtn" class="secondary">Load</button></div>
-          <div id="reportArea" class="report-panel"><div class="empty-report">Choose a member and date to load the daily report.</div></div>
+          <div id="reportArea" class="muted"></div>
         </div>
       </div>
     </div>
     <script>
-      const taskMeta = {{ task_meta | tojson }};
-      const isEditable = {{ "true" if editable else "false" }};
+      const taskMeta = {{ task_meta | safe }};
       let state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
 
       function selectedTasks(){ return Array.from(document.querySelectorAll(".taskBox")).filter(b=>b.checked).map(b=>b.value); }
-      function setMessage(message, isError=false){
-        const el = document.getElementById("err");
-        el.textContent = message || "";
-        el.classList.toggle("error", !!isError);
-      }
-      function resetState(){
-        if(state.timerId){ clearInterval(state.timerId); }
-        state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
-      }
-      function updateSelectionSummary(){
-        const ids = selectedTasks();
-        const total = ids.reduce((sum, id) => sum + Number(taskMeta[id]?.estimate || 0), 0);
-        const el = document.getElementById("selectionSummary");
-        if(!ids.length){ el.textContent = "No tasks selected"; return; }
-        el.textContent = `${ids.length} task${ids.length===1?"":"s"} selected • ${formatMinutesLabel(total)}`;
-      }
-      function setBtn(btn, enabled, active){
-        const allow = !!isEditable && !!enabled;
-        btn.disabled = !allow;
-        btn.classList.toggle("btn-active", !!active && allow);
-        btn.classList.toggle("btn-faded", !allow || !active);
-      }
+      function setBtn(btn, enabled, active){ btn.disabled = !enabled; btn.classList.toggle("btn-active", !!active); btn.classList.toggle("btn-faded", !active); }
 
       function refreshButtons(){
         const hasMember = !!document.getElementById("member").value;
@@ -838,7 +801,6 @@ def home():
         const pauseBtn = document.getElementById("pauseBtn");
         const resumeBtn = document.getElementById("resumeBtn");
         const logoutBtn = document.getElementById("logoutBtn");
-        if(!isEditable){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!hasMember){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!state.loggedIn){ setBtn(loginBtn,true,true); setBtn(pauseBtn,false,false); setBtn(resumeBtn,false,false); setBtn(logoutBtn,false,false); return; }
         if(state.loggedOut){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
@@ -849,19 +811,15 @@ def home():
       function refreshSave(){
         const saveBtn = document.getElementById("saveBtn");
         const hasMember = !!document.getElementById("member").value;
-        saveBtn.disabled = !isEditable || !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
+        saveBtn.disabled = !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
       }
 
       function renderStatus(){
         const el = document.getElementById("status");
-        const member = document.getElementById("member").value;
-        if(!member){ el.textContent = isEditable ? "Select a member to begin the day." : "Past dates are view-only. Use the report panel to review saved entries."; return; }
-        if(!isEditable){ el.textContent = "This date is locked for editing. Use the member report panel to review saved work."; return; }
-        if(!state.loggedIn){ el.textContent = "Ready to log the shift. Start with Login."; return; }
+        if(!state.loggedIn){ el.textContent = "Not logged in. Click Login."; return; }
         const loginText = state.loginAt ? state.loginAt.replace("T"," ") : "";
         const logoutText = state.loggedOut && state.logoutAt ? (" Logged out at " + state.logoutAt.replace("T"," ") + ".") : "";
-        const breakText = state.openPause ? " Break is active." : "";
-        el.textContent = "Logged in at " + loginText + "." + logoutText + breakText;
+        el.textContent = "Logged in at " + loginText + "." + logoutText;
       }
 
       function startTimer(){
@@ -887,10 +845,10 @@ def home():
 
       async function refreshStatus(){
         const member = document.getElementById("member").value;
-        if(!member || !isEditable){ resetState(); renderStatus(); refreshButtons(); refreshSave(); updateSelectionSummary(); return; }
+        if(!member){ state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:state.timerId }; if(state.timerId) clearInterval(state.timerId); renderStatus(); refreshButtons(); refreshSave(); return; }
         const res = await fetch(`/api/member-login-status?member=${encodeURIComponent(member)}`);
         const data = await res.json().catch(()=>null);
-        if(!res.ok || !data){ setMessage("Unable to load member status.", true); return; }
+        if(!res.ok || !data){ return; }
         state.loggedIn = !!data.logged_in;
         state.loggedOut = !!data.logged_out;
         state.loginAt = data.login_at;
@@ -901,7 +859,6 @@ def home():
         renderStatus();
         refreshButtons();
         refreshSave();
-        updateSelectionSummary();
         if(state.loggedIn) startTimer(); else if(state.timerId) clearInterval(state.timerId);
       }
 
@@ -912,21 +869,21 @@ def home():
         return data;
       }
 
-      document.getElementById("member").addEventListener("change", ()=>{ setMessage("Ready when you are."); refreshStatus(); });
-      document.querySelectorAll(".taskBox").forEach(b=>b.addEventListener("change", ()=>{ updateSelectionSummary(); refreshSave(); }));
-      document.getElementById("loginBtn").addEventListener("click", async ()=>{ try{ setMessage("Recording login..."); await postJson("/api/member-login",{member:document.getElementById("member").value}); setMessage("Login recorded."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
-      document.getElementById("pauseBtn").addEventListener("click", async ()=>{ try{ setMessage("Starting break..."); await postJson("/api/member-pause",{member:document.getElementById("member").value}); setMessage("Break started."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
-      document.getElementById("resumeBtn").addEventListener("click", async ()=>{ try{ setMessage("Ending break..."); await postJson("/api/member-resume",{member:document.getElementById("member").value}); setMessage("Break ended."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
-      document.getElementById("logoutBtn").addEventListener("click", async ()=>{ try{ setMessage("Recording logout..."); await postJson("/api/member-logout",{member:document.getElementById("member").value}); setMessage("Logout recorded."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); refreshSave(); });
+      document.getElementById("member").addEventListener("change", ()=>refreshStatus());
+      document.querySelectorAll(".taskBox").forEach(b=>b.addEventListener("change", refreshSave));
+      document.getElementById("loginBtn").addEventListener("click", async ()=>{ try{ await postJson("/api/member-login",{member:document.getElementById("member").value}); }catch(e){document.getElementById("err").textContent=e.message;} await refreshStatus(); });
+      document.getElementById("pauseBtn").addEventListener("click", async ()=>{ try{ await postJson("/api/member-pause",{member:document.getElementById("member").value}); }catch(e){document.getElementById("err").textContent=e.message;} await refreshStatus(); });
+      document.getElementById("resumeBtn").addEventListener("click", async ()=>{ try{ await postJson("/api/member-resume",{member:document.getElementById("member").value}); }catch(e){document.getElementById("err").textContent=e.message;} await refreshStatus(); });
+      document.getElementById("logoutBtn").addEventListener("click", async ()=>{ try{ await postJson("/api/member-logout",{member:document.getElementById("member").value}); }catch(e){document.getElementById("err").textContent=e.message;} await refreshStatus(); refreshSave(); });
 
-      document.getElementById("clearBtn").addEventListener("click", ()=>{ document.getElementById("article").value=""; document.getElementById("completed").checked=true; document.querySelectorAll(".taskBox").forEach(b=>b.checked=false); updateSelectionSummary(); refreshSave(); setMessage("Form cleared."); });
+      document.getElementById("clearBtn").addEventListener("click", ()=>{ document.getElementById("article").value=""; document.getElementById("completed").checked=true; document.querySelectorAll(".taskBox").forEach(b=>b.checked=false); refreshSave(); });
       document.getElementById("saveBtn").addEventListener("click", async ()=>{
-        setMessage("Saving entry...");
+        document.getElementById("err").textContent="";
         const member = document.getElementById("member").value;
         const article = document.getElementById("article").value.trim();
         const completed = document.getElementById("completed").checked;
         const tasks = selectedTasks();
-        try{ await postJson("/api/entries",{member,article,tasks,completed}); document.getElementById("article").value=""; document.querySelectorAll(".taskBox").forEach(b=>b.checked=false); updateSelectionSummary(); refreshSave(); setMessage("Entry saved."); }catch(e){ setMessage(e.message, true); }
+        try{ await postJson("/api/entries",{member,article,tasks,completed}); document.getElementById("article").value=""; document.querySelectorAll(".taskBox").forEach(b=>b.checked=false); refreshSave(); }catch(e){ document.getElementById("err").textContent=e.message; }
       });
 
       function formatMinutesLabel(minutes) {
@@ -961,7 +918,6 @@ def home():
           (data.entries.length? `<table><thead><tr><th>Time</th><th>Article</th><th>Status</th><th>Tasks</th><th>Spent</th></tr></thead><tbody>${rows}</tbody></table>` : "<div class='muted'>No entries.</div>");
       }
       document.getElementById("loadBtn").addEventListener("click", loadReport);
-      updateSelectionSummary();
       refreshStatus();
       refreshSave();
     </script></body></html>
@@ -976,19 +932,9 @@ def home():
         categories=categories,
         tasks_by_cat=tasks_by_cat,
         estimate_labels=estimate_labels,
-        task_meta=task_meta,
+        task_meta=json.dumps(task_meta),
     )
 
-
-@app.get("/status")
-def status():
-    """Simple status check that doesn't require database."""
-    return jsonify({
-        "status": "running",
-        "service": "Daily Report Tool",
-        "db_configured": bool(DATABASE_URL),
-        "db_initialized": _db_initialized,
-    })
 
 @app.get("/healthz")
 def healthz():
@@ -1120,7 +1066,7 @@ def create_entry():
         _execute(
             conn,
             "INSERT INTO entries(entry_date, member, article, tasks_json, completed, created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
-            (entry_date, member, article, json.dumps(task_ids), completed),
+            (entry_date, member, article, _pg().extras.Json(task_ids) if _use_postgres() else json.dumps(task_ids), completed),
         )
     return jsonify({"ok": True})
 
@@ -1182,37 +1128,17 @@ def admin_login_page():
     html = """
     <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>Admin Login</title>
-    <style>
-      *{box-sizing:border-box}
-      body{font-family:"Trebuchet MS","Segoe UI",sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;padding:18px;background:radial-gradient(circle at top left,#fff4df 0,#f4ede3 28%,#e7f1ef 62%,#dde8f5 100%);color:#182133}
-      .shell{width:min(980px,100%);display:grid;grid-template-columns:minmax(0,1.1fr) minmax(320px,.9fr);border-radius:28px;overflow:hidden;border:1px solid rgba(255,255,255,.62);background:rgba(255,255,255,.9);box-shadow:0 28px 60px rgba(24,33,51,.14);backdrop-filter:blur(12px)}
-      .hero{padding:34px;background:linear-gradient(145deg,#17324a,#22566a);color:#f7fbff}
-      .eyebrow{font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;opacity:.72}
-      .hero h1{margin:14px 0 0;font-size:clamp(30px,4vw,44px);line-height:1.04}
-      .hero p{margin:14px 0 0;font-size:15px;line-height:1.6;color:rgba(247,251,255,.78)}
-      .hero .mini{display:inline-flex;margin-top:18px;padding:10px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);font-size:12px;font-weight:700}
-      .card{padding:30px;display:flex;flex-direction:column;justify-content:center}
-      .top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
-      .top h2{margin:0;font-size:26px}
-      .top a{text-decoration:none;padding:10px 14px;border-radius:12px;border:1px solid #d6dfeb;background:#f7fafc;color:#182133;font-size:13px;font-weight:700}
-      .muted{color:#607086;font-size:14px;line-height:1.6;margin:0 0 16px}
-      label{display:block;margin-bottom:8px;font-size:12px;font-weight:700;color:#607086;letter-spacing:.06em;text-transform:uppercase}
-      input{width:100%;padding:13px 14px;border-radius:14px;border:1px solid #d6dfeb;background:#fff;font-size:15px;color:#182133;outline:none}
-      input:focus{border-color:#86cfc5;box-shadow:0 0 0 4px rgba(15,118,110,.12)}
-      button{margin-top:14px;width:100%;padding:13px 16px;border:none;border-radius:14px;background:linear-gradient(135deg,#0f766e,#115e59);color:#fff;font-size:15px;font-weight:700;cursor:pointer;box-shadow:0 18px 32px rgba(15,118,110,.24)}
-      #err{min-height:22px;margin-top:12px;color:#b42318;font-size:13px}
-      @media (max-width:860px){.shell{grid-template-columns:1fr}.hero,.card{padding:22px}}
-    </style>
-    </head><body><div class="shell"><section class="hero"><div class="eyebrow">Admin Access</div><h1>Team control center</h1><p>Review team activity, search articles, adjust task estimates, and export reports from one cleaner admin space.</p><div class="mini">Secure password required</div></section><section class="card"><div class="top"><h2>Admin Login</h2><a href="{{ url_for('home') }}">Back Home</a></div><p class="muted">Use the admin password to unlock reports, task settings, and efficiency views.</p><label for="pw">Password</label><input id="pw" type="password" placeholder="Enter password" autocomplete="current-password"><button id="btn">Login</button><div id="err"></div></section></div><script>
-      async function login(){
+    <style>body{font-family:system-ui;margin:0;display:grid;place-items:center;min-height:100vh;background:#f1f5f9} .card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;width:min(420px,92vw)} .top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0 0 10px} a{font-size:12px;text-decoration:none;background:#e2e8f0;color:#0f172a;border:1px solid #cbd5e1;padding:6px 10px;border-radius:10px;font-weight:700} input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px} button{margin-top:10px;width:100%;padding:10px 12px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700}</style>
+    </head><body><div class="card"><div class="top"><h3 style="margin:0">Admin Login</h3><a href="{{ url_for('home') }}">Back</a></div>
+    <input id="pw" type="password" placeholder="Password"><button id="btn">Login</button><div id="err" style="color:#991b1b;margin-top:8px"></div>
+    </div><script>
+      document.getElementById("btn").addEventListener("click", async ()=>{
         const pw=document.getElementById("pw").value;
         const res=await fetch("/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
         const data=await res.json().catch(()=>null);
         if(!res.ok){document.getElementById("err").textContent=data?.error||"Login failed";return;}
         window.location.href="/admin/report";
-      }
-      document.getElementById("btn").addEventListener("click", login);
-      document.getElementById("pw").addEventListener("keydown", (event)=>{ if(event.key==="Enter") login(); });
+      });
     </script></body></html>
     """
     return render_template_string(html)
@@ -2006,29 +1932,27 @@ def admin_report():
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Admin Report</title>
         <style>
-          :root { --bg-a:#fff8ea; --bg-b:#ecf5f4; --bg-c:#e8eef8; --panel:rgba(255,255,255,.92); --line:#d7e0ea; --text:#182133; --muted:#607086; --primary:#0f766e; --primary-strong:#115e59; --shadow:0 22px 50px rgba(24,33,51,.1); }
           * { box-sizing: border-box; }
-          body { font-family: "Trebuchet MS", "Segoe UI", sans-serif; margin: 0; padding: 24px 16px 32px; color: var(--text); background: radial-gradient(circle at top left, var(--bg-a) 0, #f8f1e7 22%, var(--bg-b) 58%, var(--bg-c) 100%); }
-          .wrap { max-width: 1280px; margin: 0 auto; }
-          .top { display:flex; justify-content: space-between; align-items: end; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; padding: 24px; border: 1px solid rgba(255,255,255,.58); border-radius: 26px; background: linear-gradient(145deg, rgba(255,255,255,.86), rgba(255,255,255,.68)); box-shadow: var(--shadow); backdrop-filter: blur(10px); }
-          .muted { color: var(--muted); font-size: 12px; line-height: 1.55; }
-          .card { border: 1px solid rgba(255,255,255,.66); border-radius: 24px; padding: 18px; margin-top: 14px; background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(10px); }
-          input[type=date], input[type=time], select { padding: 11px 12px; border: 1px solid var(--line); border-radius: 14px; font-size: 14px; outline: none; background: rgba(255,255,255,.96); color: var(--text); }
-          input[type=date]:focus, input[type=time]:focus, select:focus { border-color: #86cfc5; box-shadow: 0 0 0 4px rgba(15,118,110,.12); }
-          button { padding: 11px 14px; border: none; border-radius: 14px; cursor: pointer; background: linear-gradient(135deg, var(--primary), var(--primary-strong)); color: #fff; font-size: 14px; font-weight: 700; box-shadow: 0 18px 32px rgba(15,118,110,.24); }
-          button.secondary { background: rgba(255,255,255,.88); color: var(--text); border: 1px solid var(--line); box-shadow: none; }
-          button.secondary:hover { background: #fff; }
-          a { color: var(--text); text-decoration: none; font-weight: 700; }
-          .nav-link { border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; background: rgba(255,255,255,.86); }
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 28px 16px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
+          .wrap { max-width: 1260px; margin: 0 auto; }
+          .top { display:flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+          .muted { color: #64748b; font-size: 12px; }
+          .card { border: 1px solid #dbe3ee; border-radius: 14px; padding: 16px; margin-top: 12px; background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05); }
+          input[type=date], input[type=time], select { padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 14px; outline: none; background: #fff; }
+          button { padding: 10px 12px; border: none; border-radius: 10px; cursor: pointer; background: #2563eb; color: #fff; font-size: 14px; font-weight: 600; }
+          button.secondary { background: #e2e8f0; color: #0f172a; }
+          button.secondary:hover { background: #cbd5e1; }
+          a { color: #1e40af; text-decoration: none; font-weight: 600; }
+          .nav-link { border: 1px solid #cbd5e1; border-radius: 10px; padding: 8px 10px; background: #fff; }
           .inline { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-          table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-          th, td { text-align: left; border-bottom: 1px solid #e8edf3; padding: 10px 8px; font-size: 13px; vertical-align: top; }
-          th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; background: rgba(248,250,252,.72); }
-          tr:nth-child(even) td { background: rgba(252,253,255,.72); }
-          .badge { display: inline-block; margin: 2px 4px 2px 0; font-size: 12px; color: #8a5a02; background: #fff7e8; padding: 5px 10px; border-radius: 999px; white-space: nowrap; font-weight: 700; cursor: pointer; border: 1px solid #f4d28a; }
-          .entry-row.is-match td { background: #effaf8 !important; }
+          table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          th, td { text-align: left; border-bottom: 1px solid #edf2f7; padding: 8px 6px; font-size: 13px; vertical-align: top; }
+          th { font-size: 12px; color: #334155; background: #f8fafc; }
+          tr:nth-child(even) td { background: #fcfdff; }
+          .badge { display: inline-block; margin: 2px 4px 2px 0; font-size: 12px; color: #1e3a8a; background: #dbeafe; padding: 2px 8px; border-radius: 999px; white-space: nowrap; font-weight: 600; cursor: pointer; }
+          .entry-row.is-match td { background: #eff6ff !important; }
           .entry-row.is-dim td { opacity: 0.45; }
-          .task-summary { margin-top: 12px; padding: 12px 14px; border: 1px dashed var(--line); border-radius: 16px; background: rgba(255,255,255,.74); font-size: 13px; display: none; }
+          .task-summary { margin-top: 10px; padding: 10px 12px; border: 1px dashed #cbd5e1; border-radius: 10px; background: #f8fafc; font-size: 13px; display: none; }
           .btn-disabled { opacity: 0.45; pointer-events: none; }
         </style>
       </head>
@@ -2340,14 +2264,10 @@ def init():
     with _db_init_lock:
         if _db_initialized:
             return
-        try:
-            _init_db()
-            _db_initialized = True
-        except Exception as e:
-            # Log but don't crash - database will retry on next request
-            import sys
-            print(f"[WARNING] Database initialization failed: {e}", file=sys.stderr)
-            pass
+        _init_db()
+        _db_initialized = True
+
+_init_db_startup()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
