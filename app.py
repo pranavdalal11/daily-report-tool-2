@@ -433,11 +433,11 @@ def _require_admin() -> None:
         abort(401)
 
 
-def _admin_password() -> str:
+def _admin_password() -> str | None:
     pw = os.environ.get("ADMIN_PASSWORD")
     if not pw:
-        raise RuntimeError("ADMIN_PASSWORD not set")
-    return pw
+        return None
+    return str(pw)
 
 
 def _valid_member(member: str) -> bool:
@@ -1221,7 +1221,10 @@ def admin_login_page():
 def admin_login_post():
     payload = request.get_json(silent=True) or {}
     password = (payload.get("password") or "").strip()
-    if password != _admin_password():
+    expected_password = _admin_password()
+    if not expected_password:
+        return jsonify({"error": "Admin is not configured. Set ADMIN_PASSWORD in environment variables."}), 503
+    if password != expected_password:
         return jsonify({"error": "Invalid password."}), 401
     session["admin"] = True
     return jsonify({"ok": True})
