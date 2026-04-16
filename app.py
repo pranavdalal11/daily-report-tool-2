@@ -122,12 +122,10 @@ _db_init_lock = threading.Lock()
 
 def _pg():
     try:
-        import psycopg2
-        import psycopg2.extras
-        import psycopg2.pool
-        return psycopg2
+        import psycopg
+        return psycopg
     except ModuleNotFoundError as e:
-        raise RuntimeError("psycopg2 is not installed. Run: pip install -r requirements.txt") from e
+        raise RuntimeError("psycopg is not installed. Run: pip install -r requirements.txt") from e
 
 def _use_postgres() -> bool:
     return bool(DATABASE_URL) and str(DATABASE_URL).startswith(("postgres://", "postgresql://"))
@@ -240,6 +238,7 @@ def _db():
     if _use_postgres():
         pool = _get_pool()
         conn = pool.getconn()
+        conn.row_factory = _pg().rows.dict_row
         try:
             yield conn
             conn.commit()
@@ -265,7 +264,7 @@ def _db():
 
 def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
     if _use_postgres():
-        with conn.cursor(cursor_factory=_pg().extras.RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute(sql, params or ())
             row = cur.fetchone()
     else:
@@ -277,7 +276,7 @@ def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
 
 def _fetchall(conn, sql: str, params: tuple | None = None) -> list[dict]:
     if _use_postgres():
-        with conn.cursor(cursor_factory=_pg().extras.RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute(sql, params or ())
             rows = cur.fetchall()
     else:
@@ -1115,7 +1114,7 @@ def create_entry():
         _execute(
             conn,
             "INSERT INTO entries(entry_date, member, article, tasks_json, completed, created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
-            (entry_date, member, article, _pg().extras.Json(task_ids) if _use_postgres() else json.dumps(task_ids), completed),
+            (entry_date, member, article, _pg().types.json.Jsonb(task_ids) if _use_postgres() else json.dumps(task_ids), completed),
         )
     return jsonify({"ok": True})
 
