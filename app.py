@@ -13,6 +13,9 @@ from flask import Flask, Response, abort, jsonify, redirect, render_template_str
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import atexit
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
 @atexit.register
 def close_pool():
@@ -122,10 +125,10 @@ _db_init_lock = threading.Lock()
 
 def _pg():
     try:
-        import psycopg
-        return psycopg
+        import psycopg2
+        return psycopg2
     except ModuleNotFoundError as e:
-        raise RuntimeError("psycopg is not installed. Run: pip install -r requirements.txt") from e
+        raise RuntimeError("psycopg2 not installed") from e
 
 def _use_postgres() -> bool:
     return bool(DATABASE_URL) and str(DATABASE_URL).startswith(("postgres://", "postgresql://"))
@@ -162,18 +165,11 @@ def _get_pool():
         return _pool
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
-    pg = _pg()
-    connect_args = _pg_connect_args()
-    _pool = pg.pool.ThreadedConnectionPool(
+    _pool = ThreadedConnectionPool(
         1,
         int(os.environ.get("DB_POOL_MAX", "10")),
         DATABASE_URL,
-        connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT", "10")),
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-        **connect_args,
+        sslmode="require"
     )
     return _pool
 
@@ -264,7 +260,7 @@ def _db():
 
 def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
     if _use_postgres():
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
             row = cur.fetchone()
     else:
@@ -276,7 +272,7 @@ def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
 
 def _fetchall(conn, sql: str, params: tuple | None = None) -> list[dict]:
     if _use_postgres():
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
             rows = cur.fetchall()
     else:
@@ -1114,7 +1110,7 @@ def create_entry():
         _execute(
             conn,
             "INSERT INTO entries(entry_date, member, article, tasks_json, completed, created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
-            (entry_date, member, article, _pg().types.json.Jsonb(task_ids) if _use_postgres() else json.dumps(task_ids), completed),
+            (entry_date, member, article, json.dumps(task_ids), completed),
         )
     return jsonify({"ok": True})
 
