@@ -169,7 +169,7 @@ def _get_pool():
         1,
         int(os.environ.get("DB_POOL_MAX", "10")),
         DATABASE_URL,
-        sslmode="require"
+        **_pg_connect_args(),
     )
     return _pool
 
@@ -245,16 +245,16 @@ def _db():
         return
 
     os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
-    conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
-    conn.row_factory = _pg().rows.dict_row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+try:
+    yield conn
+    conn.commit()
+except Exception:
+    conn.rollback()
+    raise
+finally:
+    conn.close()
 
 
 def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
