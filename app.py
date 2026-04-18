@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 import secrets
@@ -46,6 +47,46 @@ MEMBER_NAMES = [
     "Yashpalsingh Chauhan",
     "Vidhi Trivedi",
 ]
+
+DEFAULT_TEAM_ID = "default"
+DEFAULT_TEAM_NAME = "Default"
+
+
+def _normalize_team_id(value: str) -> str:
+    v = (value or "").strip().lower()
+    out = []
+    for ch in v:
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in {" ", "-", "_"}:
+            if out and out[-1] != "-":
+                out.append("-")
+    tid = "".join(out).strip("-")
+    return tid or DEFAULT_TEAM_ID
+
+
+def _team_prefix(team_id: str) -> str:
+    tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    return f"{tid}::"
+
+
+def _team_scoped_value(value: str, team_id: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return v
+    if team_id == DEFAULT_TEAM_ID:
+        return v
+    prefix = _team_prefix(team_id)
+    return v if v.startswith(prefix) else prefix + v
+
+
+def _team_unscoped_value(value: str, team_id: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return v
+    prefix = _team_prefix(team_id)
+    return v[len(prefix) :] if v.startswith(prefix) else v
+
 
 WORKDAY_MINUTES = 465
 
@@ -119,6 +160,14 @@ if os.environ.get("RENDER"):
 
 @app.before_request
 def _assign_request_id():
+    ensure_db()
+    if request.path.startswith("/admin") and not _is_admin_session_valid():
+        if request.path in {"/admin/login", "/admin/logout"}:
+            pass
+        elif request.path.startswith("/admin/login"):
+            pass
+        else:
+            return redirect(url_for("admin_login_page"))
     g.request_id = request.headers.get("X-Request-ID") or secrets.token_hex(8)
 
 
@@ -156,6 +205,8 @@ _TASK_CACHE_TTL_SECONDS = 15.0
 _task_cache: dict[str, tuple[float, list[Task]]] = {}
 _ADMIN_REPORT_CACHE_TTL_SECONDS = 20.0
 _admin_report_cache: dict[str, tuple[float, str]] = {}
+_tasks_version_cache: dict[str, tuple[float, str]] = {}
+_teams_version_cache: tuple[float, str] | None = None
 
 _pool = None
 _db_initialized = False
@@ -350,31 +401,46 @@ def _sqlite_restore_enabled() -> bool:
     return _env_flag("ALLOW_DB_RESTORE")
 
 
-def _db_backup_payload() -> dict:
+def _db_backup_payload(team_id: str | None = None) -> dict:
+    tid = (team_id or "").strip()
+    params: tuple = ()
+    where = ""
+    if tid:
+        where = "WHERE team_id=%s"
+        params = (tid,)
     with _db() as conn:
         entries = _fetchall(
             conn,
             _sql(
-                "SELECT id, entry_date::text AS entry_date, member, article, tasks_json, completed, created_at, NOW() AS exported_at FROM entries ORDER BY created_at, id",
-                "SELECT id, entry_date AS entry_date, member, article, tasks_json, completed, created_at, CURRENT_TIMESTAMP AS exported_at FROM entries ORDER BY created_at, id",
+                f"SELECT id, team_id, entry_date::text AS entry_date, member, article, tasks_json, completed, created_at, NOW() AS exported_at FROM entries {where} ORDER BY created_at, id",
+                f"SELECT id, team_id, entry_date AS entry_date, member, article, tasks_json, completed, created_at, CURRENT_TIMESTAMP AS exported_at FROM entries {where} ORDER BY created_at, id",
             ),
+            params,
         )
         member_logins = _fetchall(
             conn,
             _sql(
-                "SELECT id, entry_date::text AS entry_date, member, login_at, logout_at FROM member_logins ORDER BY entry_date, member",
-                "SELECT id, entry_date AS entry_date, member, login_at, logout_at FROM member_logins ORDER BY entry_date, member",
+                f"SELECT id, team_id, entry_date::text AS entry_date, member, login_at, logout_at FROM member_logins {where} ORDER BY entry_date, member",
+                f"SELECT id, team_id, entry_date AS entry_date, member, login_at, logout_at FROM member_logins {where} ORDER BY entry_date, member",
             ),
+            params,
         )
         member_pauses = _fetchall(
             conn,
             _sql(
-                "SELECT id, entry_date::text AS entry_date, member, pause_start, pause_end FROM member_pauses ORDER BY entry_date, member, pause_start",
-                "SELECT id, entry_date AS entry_date, member, pause_start, pause_end FROM member_pauses ORDER BY entry_date, member, pause_start",
+                f"SELECT id, team_id, entry_date::text AS entry_date, member, pause_start, pause_end FROM member_pauses {where} ORDER BY entry_date, member, pause_start",
+                f"SELECT id, team_id, entry_date AS entry_date, member, pause_start, pause_end FROM member_pauses {where} ORDER BY entry_date, member, pause_start",
             ),
+            params,
         )
-        tasks = _fetchall(conn, "SELECT id, label, estimate, category, active FROM tasks ORDER BY category, label")
+        tasks = _fetchall(conn, f"SELECT id, team_id, label, estimate, category, active FROM tasks {where} ORDER BY category, label", params)
         categories = _fetchall(conn, "SELECT name FROM task_categories ORDER BY name")
+        if tid:
+            team_rows = _fetchall(conn, "SELECT id, name FROM teams WHERE id=%s", (tid,))
+            members_rows = _fetchall(conn, "SELECT team_id, member, active FROM team_members WHERE team_id=%s ORDER BY member", (tid,))
+        else:
+            team_rows = _fetchall(conn, "SELECT id, name FROM teams ORDER BY name")
+            members_rows = _fetchall(conn, "SELECT team_id, member, active FROM team_members ORDER BY team_id, member")
 
     for r in entries:
         r["created_at"] = _dt_to_iso(r.get("created_at"))
@@ -395,18 +461,29 @@ def _db_backup_payload() -> dict:
         if not _use_postgres():
             r["active"] = bool(int(r.get("active") or 0))
 
+    category_names = [str(c["name"]) for c in categories]
+    if tid:
+        prefix = _team_prefix(tid)
+        if tid == DEFAULT_TEAM_ID:
+            category_names = [c for c in category_names if ("::" not in c or c.startswith(prefix))]
+        else:
+            category_names = [c for c in category_names if c.startswith(prefix)]
+
     return {
         "meta": {
             "exported_at": datetime.now(_APP_TZ).isoformat(timespec="seconds"),
             "timezone": str(_APP_TZ),
             "db": "postgres" if _use_postgres() else "sqlite",
+            "team_id": tid or None,
         },
         "tables": {
+            "teams": team_rows,
+            "team_members": members_rows,
             "entries": entries,
             "member_logins": member_logins,
             "member_pauses": member_pauses,
             "tasks": tasks,
-            "task_categories": categories,
+            "task_categories": [{"name": n} for n in category_names],
         },
     }
 
@@ -519,12 +596,126 @@ def _execute(conn, sql: str, params: tuple | None = None) -> None:
 
 def _init_db() -> None:
     with _db() as conn:
+        def _try(sql: str, params: tuple | None = None) -> None:
+            try:
+                _execute(conn, sql, params)
+            except Exception:
+                return
+
+        if _use_postgres():
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS teams (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL UNIQUE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS team_members (
+                  team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                  member TEXT NOT NULL,
+                  active BOOLEAN NOT NULL DEFAULT TRUE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  PRIMARY KEY (team_id, member)
+                )
+                """,
+            )
+        else:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS teams (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL UNIQUE,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+            )
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS team_members (
+                  team_id TEXT NOT NULL,
+                  member TEXT NOT NULL,
+                  active INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (team_id, member)
+                )
+                """,
+            )
+
+        if _use_postgres():
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+            )
+        else:
+            _execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """,
+            )
+
+        _execute(
+            conn,
+            _sql(
+                "INSERT INTO teams(id, name) VALUES(%s,%s) ON CONFLICT (id) DO NOTHING",
+                "INSERT OR IGNORE INTO teams(id, name) VALUES(?,?)",
+            ),
+            (DEFAULT_TEAM_ID, DEFAULT_TEAM_NAME),
+        )
+        for m in MEMBER_NAMES:
+            _execute(
+                conn,
+                _sql(
+                    "INSERT INTO team_members(team_id, member, active) VALUES(%s,%s,TRUE) ON CONFLICT DO NOTHING",
+                    "INSERT OR IGNORE INTO team_members(team_id, member, active) VALUES(?,?,1)",
+                ),
+                (DEFAULT_TEAM_ID, m),
+            )
+
+        for t in _fetchall(conn, "SELECT id FROM teams"):
+            tid = str(t["id"])
+            _execute(
+                conn,
+                _sql(
+                    "INSERT INTO app_state(key, value, updated_at) VALUES(%s,%s,NOW()) ON CONFLICT (key) DO NOTHING",
+                    "INSERT OR IGNORE INTO app_state(key, value, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
+                ),
+                (f"tasks_version:{tid}", "1"),
+            )
+        _execute(
+            conn,
+            _sql(
+                "INSERT INTO app_state(key, value, updated_at) VALUES(%s,%s,NOW()) ON CONFLICT (key) DO NOTHING",
+                "INSERT OR IGNORE INTO app_state(key, value, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)",
+            ),
+            ("teams_version", "1"),
+        )
+
         if _use_postgres():
             _execute(
                 conn,
                 """
                 CREATE TABLE IF NOT EXISTS entries (
                   id BIGSERIAL PRIMARY KEY,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date DATE NOT NULL,
                   member TEXT NOT NULL,
                   article TEXT NOT NULL,
@@ -540,6 +731,7 @@ def _init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS entries (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date TEXT NOT NULL,
                   member TEXT NOT NULL,
                   article TEXT NOT NULL,
@@ -549,14 +741,17 @@ def _init_db() -> None:
                 )
                 """,
             )
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_entries_date ON entries(entry_date)")
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_entries_member_date ON entries(member, entry_date)")
+        _try(_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT 'default'", "ALTER TABLE entries ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default'"))
+        _try("UPDATE entries SET team_id='default' WHERE team_id IS NULL OR team_id=''")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_entries_team_date ON entries(team_id, entry_date)")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_entries_team_member_date ON entries(team_id, member, entry_date)")
         if _use_postgres():
             _execute(
                 conn,
                 """
                 CREATE TABLE IF NOT EXISTS member_logins (
                   id BIGSERIAL PRIMARY KEY,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date DATE NOT NULL,
                   member TEXT NOT NULL,
                   login_at TIMESTAMPTZ NOT NULL,
@@ -570,6 +765,7 @@ def _init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS member_logins (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date TEXT NOT NULL,
                   member TEXT NOT NULL,
                   login_at TEXT NOT NULL,
@@ -577,14 +773,18 @@ def _init_db() -> None:
                 )
                 """,
             )
-        _execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_member_logins_unique ON member_logins(entry_date, member)")
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_logins_date ON member_logins(entry_date)")
+        _try(_sql("ALTER TABLE member_logins ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT 'default'", "ALTER TABLE member_logins ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default'"))
+        _try("UPDATE member_logins SET team_id='default' WHERE team_id IS NULL OR team_id=''")
+        _try("DROP INDEX IF EXISTS idx_member_logins_unique")
+        _execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS idx_member_logins_unique ON member_logins(team_id, entry_date, member)")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_logins_team_date ON member_logins(team_id, entry_date)")
         if _use_postgres():
             _execute(
                 conn,
                 """
                 CREATE TABLE IF NOT EXISTS member_pauses (
                   id BIGSERIAL PRIMARY KEY,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date DATE NOT NULL,
                   member TEXT NOT NULL,
                   pause_start TIMESTAMPTZ NOT NULL,
@@ -598,6 +798,7 @@ def _init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS member_pauses (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   entry_date TEXT NOT NULL,
                   member TEXT NOT NULL,
                   pause_start TEXT NOT NULL,
@@ -605,8 +806,10 @@ def _init_db() -> None:
                 )
                 """,
             )
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_pauses_member_date ON member_pauses(member, entry_date)")
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_pauses_date ON member_pauses(entry_date)")
+        _try(_sql("ALTER TABLE member_pauses ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT 'default'", "ALTER TABLE member_pauses ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default'"))
+        _try("UPDATE member_pauses SET team_id='default' WHERE team_id IS NULL OR team_id=''")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_pauses_team_member_date ON member_pauses(team_id, member, entry_date)")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_member_pauses_team_date ON member_pauses(team_id, entry_date)")
         _execute(conn, "CREATE TABLE IF NOT EXISTS task_categories (name TEXT PRIMARY KEY)")
         if _use_postgres():
             _execute(
@@ -614,6 +817,7 @@ def _init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                   id TEXT PRIMARY KEY,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   label TEXT NOT NULL,
                   estimate INTEGER NOT NULL,
                   category TEXT NOT NULL,
@@ -627,6 +831,7 @@ def _init_db() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS tasks (
                   id TEXT PRIMARY KEY,
+                  team_id TEXT NOT NULL DEFAULT 'default',
                   label TEXT NOT NULL,
                   estimate INTEGER NOT NULL,
                   category TEXT NOT NULL,
@@ -634,9 +839,11 @@ def _init_db() -> None:
                 )
                 """,
             )
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category)")
-        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(active)")
-        row = _fetchone(conn, "SELECT COUNT(1) AS c FROM tasks")
+        _try(_sql("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS team_id TEXT NOT NULL DEFAULT 'default'", "ALTER TABLE tasks ADD COLUMN team_id TEXT NOT NULL DEFAULT 'default'"))
+        _try("UPDATE tasks SET team_id='default' WHERE team_id IS NULL OR team_id=''")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_tasks_team_category ON tasks(team_id, category)")
+        _execute(conn, "CREATE INDEX IF NOT EXISTS idx_tasks_team_active ON tasks(team_id, active)")
+        row = _fetchone(conn, "SELECT COUNT(1) AS c FROM tasks WHERE team_id=%s", (DEFAULT_TEAM_ID,))
         if row and int(row["c"]) == 0:
             for c in sorted({t.category for t in DEFAULT_TASKS}):
                 _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (c,))
@@ -644,20 +851,31 @@ def _init_db() -> None:
                 if _use_postgres():
                     _execute(
                         conn,
-                        "INSERT INTO tasks(id, label, estimate, category, active) VALUES(%s,%s,%s,%s,TRUE) ON CONFLICT DO NOTHING",
-                        (t.id, t.label, int(t.estimate), t.category),
+                        "INSERT INTO tasks(id, team_id, label, estimate, category, active) VALUES(%s,%s,%s,%s,%s,TRUE) ON CONFLICT DO NOTHING",
+                        (t.id, DEFAULT_TEAM_ID, t.label, int(t.estimate), t.category),
                     )
                 else:
                     _execute(
                         conn,
-                        "INSERT OR IGNORE INTO tasks(id, label, estimate, category, active) VALUES(?,?,?,?,1)",
-                        (t.id, t.label, int(t.estimate), t.category),
+                        "INSERT OR IGNORE INTO tasks(id, team_id, label, estimate, category, active) VALUES(?,?,?,?,?,1)",
+                        (t.id, DEFAULT_TEAM_ID, t.label, int(t.estimate), t.category),
                     )
 
 
 def _require_admin() -> None:
-    if not session.get("admin"):
+    if not _is_admin_session_valid():
         abort(401)
+
+
+def _admin_team_id() -> str:
+    tid = (request.args.get("team") or "").strip()
+    if not tid:
+        tid = str(session.get("admin_team") or "").strip()
+    tid = tid or DEFAULT_TEAM_ID
+    if not _team_exists(tid):
+        tid = DEFAULT_TEAM_ID
+    session["admin_team"] = tid
+    return tid
 
 
 def _admin_password() -> str | None:
@@ -670,6 +888,7 @@ def _admin_password() -> str | None:
 _admin_login_attempts: dict[str, list[float]] = {}
 _ADMIN_LOGIN_WINDOW_SECONDS = 10 * 60.0
 _ADMIN_LOGIN_MAX_ATTEMPTS = 8
+_ADMIN_SESSION_TTL_SECONDS = float(os.environ.get("ADMIN_SESSION_TTL_SECONDS") or (12 * 60 * 60))
 
 
 def _admin_login_client_key() -> str:
@@ -677,28 +896,194 @@ def _admin_login_client_key() -> str:
     return forwarded or (request.remote_addr or "unknown")
 
 
-def _valid_member(member: str) -> bool:
-    return member in MEMBER_NAMES
+def _admin_session_fingerprint() -> str:
+    ua = request.headers.get("User-Agent") or ""
+    ip = _admin_login_client_key()
+    raw = f"{ua}|{ip}|{SECRET_KEY}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _load_tasks_from_db(active_only: bool) -> list[Task]:
+def _admin_token_sig(token: str, issued: int, fp: str) -> str:
+    raw = f"{token}|{issued}|{fp}|{SECRET_KEY}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _grant_admin_session() -> None:
+    token = secrets.token_urlsafe(24)
+    issued = int(time.time())
+    fp = _admin_session_fingerprint()
+    session["admin"] = True
+    session["admin_token"] = token
+    session["admin_issued_at"] = issued
+    session["admin_fp"] = fp
+    session["admin_sig"] = _admin_token_sig(token, issued, fp)
+
+
+def _clear_admin_session() -> None:
+    session.pop("admin", None)
+    session.pop("admin_token", None)
+    session.pop("admin_issued_at", None)
+    session.pop("admin_fp", None)
+    session.pop("admin_sig", None)
+
+
+def _is_admin_session_valid() -> bool:
+    if not session.get("admin"):
+        return False
+    token = str(session.get("admin_token") or "")
+    issued = int(session.get("admin_issued_at") or 0)
+    fp = str(session.get("admin_fp") or "")
+    sig = str(session.get("admin_sig") or "")
+    if not token or issued <= 0 or not fp or not sig:
+        return False
+    if (time.time() - float(issued)) > _ADMIN_SESSION_TTL_SECONDS:
+        return False
+    if fp != _admin_session_fingerprint():
+        return False
+    return sig == _admin_token_sig(token, issued, fp)
+
+
+def _team_exists(team_id: str) -> bool:
+    tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    with _db() as conn:
+        row = _fetchone(conn, "SELECT id FROM teams WHERE id=%s LIMIT 1", (tid,))
+    return bool(row)
+
+
+def _all_teams() -> list[dict]:
+    with _db() as conn:
+        rows = _fetchall(conn, "SELECT id, name FROM teams ORDER BY name")
+    return [{"id": str(r["id"]), "name": str(r["name"])} for r in rows]
+
+
+def _team_members(team_id: str) -> list[str]:
+    tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    with _db() as conn:
+        rows = _fetchall(conn, "SELECT member FROM team_members WHERE team_id=%s AND active=TRUE ORDER BY member", (tid,))
+    return [str(r["member"]) for r in rows]
+
+
+def _get_team_id() -> str:
+    tid = (request.args.get("team") or "").strip()
+    if not tid:
+        tid = str(session.get("team") or "").strip()
+    tid = tid or DEFAULT_TEAM_ID
+    if not _team_exists(tid):
+        tid = DEFAULT_TEAM_ID
+    session["team"] = tid
+    return tid
+
+
+def _resolve_team_id(payload: dict | None = None) -> str:
+    tid = ""
+    if payload:
+        tid = str(payload.get("team") or "").strip()
+    if not tid:
+        tid = (request.args.get("team") or "").strip()
+    if not tid:
+        tid = str(session.get("team") or "").strip()
+    tid = tid or DEFAULT_TEAM_ID
+    if not _team_exists(tid):
+        tid = DEFAULT_TEAM_ID
+    session["team"] = tid
+    return tid
+
+
+def _valid_member(member: str, team_id: str) -> bool:
+    m = (member or "").strip()
+    if not m:
+        return False
+    with _db() as conn:
+        row = _fetchone(conn, "SELECT member FROM team_members WHERE team_id=%s AND member=%s AND active=TRUE LIMIT 1", (team_id, m))
+    return bool(row)
+
+
+def _load_tasks_from_db(active_only: bool, team_id: str) -> list[Task]:
     with _db() as conn:
         if active_only:
-            rows = _fetchall(conn, "SELECT id, label, estimate, category FROM tasks WHERE active=TRUE ORDER BY category, label")
+            rows = _fetchall(conn, "SELECT id, label, estimate, category FROM tasks WHERE team_id=%s AND active=TRUE ORDER BY category, label", (team_id,))
         else:
-            rows = _fetchall(conn, "SELECT id, label, estimate, category FROM tasks ORDER BY category, label")
+            rows = _fetchall(conn, "SELECT id, label, estimate, category FROM tasks WHERE team_id=%s ORDER BY category, label", (team_id,))
     return [Task(id=str(r["id"]), label=str(r["label"]), estimate=int(r["estimate"]), category=str(r["category"])) for r in rows]
 
 
-def _current_tasks(active_only: bool = True) -> list[Task]:
-    key = "active" if active_only else "all"
+def _team_tasks_version(team_id: str, use_cache: bool = True) -> str:
+    tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    now = time.time()
+    cached = _tasks_version_cache.get(tid)
+    if use_cache and cached and (now - cached[0]) < 3.0:
+        return cached[1]
+    key = f"tasks_version:{tid}"
+    version = "0"
+    try:
+        with _db() as conn:
+            row = _fetchone(conn, "SELECT value FROM app_state WHERE key=%s LIMIT 1", (key,))
+            if row and row.get("value"):
+                version = str(row["value"])
+    except Exception:
+        version = str(int(now))
+    _tasks_version_cache[tid] = (now, version)
+    return version
+
+
+def _global_teams_version(use_cache: bool = True) -> str:
+    global _teams_version_cache
+    now = time.time()
+    if use_cache and _teams_version_cache and (now - _teams_version_cache[0]) < 3.0:
+        return _teams_version_cache[1]
+    version = "0"
+    try:
+        with _db() as conn:
+            row = _fetchone(conn, "SELECT value FROM app_state WHERE key=%s LIMIT 1", ("teams_version",))
+            if row and row.get("value"):
+                version = str(row["value"])
+    except Exception:
+        version = str(int(now))
+    _teams_version_cache = (now, version)
+    return version
+
+
+def _bump_global_teams_version() -> None:
+    global _teams_version_cache
+    ver = str(int(time.time() * 1000))
+    with _db() as conn:
+        _execute(
+            conn,
+            _sql(
+                "INSERT INTO app_state(key, value, updated_at) VALUES(%s,%s,NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+                "INSERT INTO app_state(key, value, updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            ),
+            ("teams_version", ver),
+        )
+    _teams_version_cache = (time.time(), ver)
+
+
+def _bump_team_tasks_version(team_id: str) -> None:
+    tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    key = f"tasks_version:{tid}"
+    ver = str(int(time.time() * 1000))
+    with _db() as conn:
+        _execute(
+            conn,
+            _sql(
+                "INSERT INTO app_state(key, value, updated_at) VALUES(%s,%s,NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+                "INSERT INTO app_state(key, value, updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            ),
+            (key, ver),
+        )
+    _tasks_version_cache[tid] = (time.time(), ver)
+
+
+def _current_tasks(team_id: str, active_only: bool = True) -> list[Task]:
+    version = _team_tasks_version(team_id)
+    key = f"{team_id}:{version}:active" if active_only else f"{team_id}:{version}:all"
     cached = _task_cache.get(key)
     now = time.time()
     if cached and (now - cached[0]) < _TASK_CACHE_TTL_SECONDS:
         return cached[1]
     tasks: list[Task] = []
     try:
-        tasks = _load_tasks_from_db(active_only=active_only)
+        tasks = _load_tasks_from_db(active_only=active_only, team_id=team_id)
     except Exception:
         tasks = []
     if not tasks:
@@ -707,12 +1092,12 @@ def _current_tasks(active_only: bool = True) -> list[Task]:
     return tasks
 
 
-def _task_map(include_inactive: bool = False) -> dict[str, Task]:
-    tasks = _current_tasks(active_only=not include_inactive)
+def _task_map(team_id: str, include_inactive: bool = False) -> dict[str, Task]:
+    tasks = _current_tasks(team_id=team_id, active_only=not include_inactive)
     return {t.id: t for t in tasks}
 
 
-def _normalize_task_ids(raw_ids: list[str]) -> list[str]:
+def _normalize_task_ids(raw_ids: list[str], team_id: str) -> list[str]:
     ids: list[str] = []
     for item in raw_ids:
         if not isinstance(item, str):
@@ -721,15 +1106,15 @@ def _normalize_task_ids(raw_ids: list[str]) -> list[str]:
         if v:
             ids.append(v)
     deduped = list(dict.fromkeys(ids))
-    task_by_id = _task_map(include_inactive=False)
+    task_by_id = _task_map(team_id=team_id, include_inactive=False)
     unknown = [t for t in deduped if t not in task_by_id]
     if unknown:
         raise ValueError(f"Unknown task id(s): {', '.join(unknown)}")
     return deduped
 
 
-def _task_estimate(task_id: str) -> int:
-    task_by_id = _task_map(include_inactive=True)
+def _task_estimate(task_id: str, team_id: str) -> int:
+    task_by_id = _task_map(team_id=team_id, include_inactive=True)
     if task_id in task_by_id:
         return task_by_id[task_id].estimate
     legacy = LEGACY_TASKS.get(task_id)
@@ -738,8 +1123,8 @@ def _task_estimate(task_id: str) -> int:
     return 0
 
 
-def _task_label(task_id: str) -> str:
-    task_by_id = _task_map(include_inactive=True)
+def _task_label(task_id: str, team_id: str) -> str:
+    task_by_id = _task_map(team_id=team_id, include_inactive=True)
     if task_id in task_by_id:
         return task_by_id[task_id].label
     legacy = LEGACY_TASKS.get(task_id)
@@ -748,28 +1133,28 @@ def _task_label(task_id: str) -> str:
     return f"Unknown Task ({task_id})"
 
 
-def _member_login_record_for_date(member: str, entry_date: str) -> dict | None:
+def _member_login_record_for_date(member: str, entry_date: str, team_id: str) -> dict | None:
     with _db() as conn:
-        row = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1", (member, entry_date))
+        row = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND entry_date=%s LIMIT 1", (team_id, member, entry_date))
     if not row:
         if entry_date == _today_str():
-            active = _active_shift_record(member)
+            active = _active_shift_record(member, team_id)
             if active and active.get("login_at") and not active.get("logout_at"):
                 return {"login_at": active["login_at"], "logout_at": active["logout_at"]}
         return None
     return {"login_at": _dt_to_iso(row["login_at"]), "logout_at": _dt_to_iso(row["logout_at"])}
 
 
-def _active_shift_record(member: str) -> dict | None:
+def _active_shift_record(member: str, team_id: str) -> dict | None:
     today = _today_str()
     with _db() as conn:
         open_row = _fetchone(
             conn,
             _sql(
-                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
-                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
+                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
+                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
             ),
-            (member,),
+            (team_id, member),
         )
         if open_row:
             return {"entry_date": str(open_row["entry_date"]), "login_at": _dt_to_iso(open_row["login_at"]), "logout_at": _dt_to_iso(open_row["logout_at"])}
@@ -777,29 +1162,29 @@ def _active_shift_record(member: str) -> dict | None:
         row = _fetchone(
             conn,
             _sql(
-                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1",
-                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1",
+                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND entry_date=%s LIMIT 1",
+                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND entry_date=%s LIMIT 1",
             ),
-            (member, today),
+            (team_id, member, today),
         )
     if not row:
         return None
     return {"entry_date": str(row["entry_date"]), "login_at": _dt_to_iso(row["login_at"]), "logout_at": _dt_to_iso(row["logout_at"])}
 
 
-def _member_login_for_date(member: str, entry_date: str) -> str | None:
-    rec = _member_login_record_for_date(member, entry_date)
+def _member_login_for_date(member: str, entry_date: str, team_id: str) -> str | None:
+    rec = _member_login_record_for_date(member, entry_date, team_id)
     return rec["login_at"] if rec else None
 
 
-def _pause_rows_for_member_date(member: str, entry_date: str) -> list[dict]:
+def _pause_rows_for_member_date(member: str, entry_date: str, team_id: str) -> list[dict]:
     with _db() as conn:
-        rows = _fetchall(conn, "SELECT pause_start, pause_end FROM member_pauses WHERE member=%s AND entry_date=%s ORDER BY pause_start", (member, entry_date))
+        rows = _fetchall(conn, "SELECT pause_start, pause_end FROM member_pauses WHERE team_id=%s AND member=%s AND entry_date=%s ORDER BY pause_start", (team_id, member, entry_date))
     return [{"start": _dt_to_iso(r["pause_start"]), "end": _dt_to_iso(r["pause_end"])} for r in rows]
 
 
-def _pause_state_for_member(member: str, entry_date: str) -> dict:
-    pauses = _pause_rows_for_member_date(member, entry_date)
+def _pause_state_for_member(member: str, entry_date: str, team_id: str) -> dict:
+    pauses = _pause_rows_for_member_date(member, entry_date, team_id)
     closed_seconds = 0
     open_start = None
     for p in pauses:
@@ -817,17 +1202,17 @@ def _pause_state_for_member(member: str, entry_date: str) -> dict:
     return {"paused_closed_seconds": closed_seconds, "open_pause_start": open_start}
 
 
-def _build_member_day_entries(member: str, entry_date: str) -> dict:
-    login_rec = _member_login_record_for_date(member, entry_date)
+def _build_member_day_entries(member: str, entry_date: str, team_id: str) -> dict:
+    login_rec = _member_login_record_for_date(member, entry_date, team_id)
     login_at = login_rec["login_at"] if login_rec else None
     logout_at = login_rec["logout_at"] if login_rec else None
-    pauses = _pause_rows_for_member_date(member, entry_date)
+    pauses = _pause_rows_for_member_date(member, entry_date, team_id)
 
     with _db() as conn:
         rows = _fetchall(
             conn,
-            "SELECT id, entry_date::text AS entry_date, article, tasks_json, completed, created_at FROM entries WHERE member=%s AND entry_date=%s ORDER BY created_at, id",
-            (member, entry_date),
+            "SELECT id, entry_date::text AS entry_date, article, tasks_json, completed, created_at FROM entries WHERE team_id=%s AND member=%s AND entry_date=%s ORDER BY created_at, id",
+            (team_id, member, entry_date),
         )
 
     task_state: dict[tuple[str, str], dict] = {}
@@ -864,7 +1249,7 @@ def _build_member_day_entries(member: str, entry_date: str) -> dict:
                 if state["start"] is None:
                     state["start"] = created_at
                 if float(state["spent"]) <= 0.0:
-                    state["spent"] = float(_task_estimate(task_id))
+                    state["spent"] = float(_task_estimate(task_id, team_id))
                     state["spent_is_estimate"] = True
                 state["completed"] = False
             else:
@@ -873,7 +1258,7 @@ def _build_member_day_entries(member: str, entry_date: str) -> dict:
                     state["spent"] = float(delta)
                     state["spent_is_estimate"] = False
                 elif float(state["spent"]) <= 0.0:
-                    state["spent"] = float(_task_estimate(task_id))
+                    state["spent"] = float(_task_estimate(task_id, team_id))
                     state["spent_is_estimate"] = True
                 state["completed"] = True
 
@@ -935,7 +1320,7 @@ def _build_member_day_entries(member: str, entry_date: str) -> dict:
                 "article": a["article"],
                 "tasks": list(dict.fromkeys(a["tasks"])),
                 "task_spent": a["task_spent"],
-                "task_labels": [_task_label(tid) for tid in list(dict.fromkeys(a["tasks"]))],
+                "task_labels": [_task_label(tid, team_id) for tid in list(dict.fromkeys(a["tasks"]))],
                 "completed": bool(a["completed"]),
                 "overtime": overtime,
                 "spent_total": float(a["spent_total"]),
@@ -958,18 +1343,22 @@ def home():
     except Exception:
         selected_date = _today_str()
 
+    team_id = _resolve_team_id()
+    teams = _all_teams()
+    members = _team_members(team_id)
+
     editable = selected_date == _today_str()
-    active_tasks = _current_tasks(active_only=True)
-    categories = sorted({t.category for t in active_tasks})
+    active_tasks = _current_tasks(team_id=team_id, active_only=True)
+    categories = sorted({_team_unscoped_value(t.category, team_id) for t in active_tasks})
     tasks_by_cat: dict[str, list[Task]] = {c: [] for c in categories}
     for t in active_tasks:
-        tasks_by_cat[t.category].append(t)
+        tasks_by_cat[_team_unscoped_value(t.category, team_id)].append(t)
     estimate_labels = {t.id: _minutes_label(t.estimate) for t in active_tasks}
-    task_meta = {t.id: {"label": t.label, "estimate": t.estimate, "category": t.category} for t in _current_tasks(active_only=False)}
+    task_meta = {t.id: {"label": t.label, "estimate": t.estimate, "category": t.category} for t in _current_tasks(team_id=team_id, active_only=False)}
 
     html = """
     <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-    <title>Daily Tool</title>
+    <title>Daily Report Tool - {{ team_name }}</title>
     <style>
       :root{--bg-a:#fff8ea;--bg-b:#ecf5f4;--bg-c:#e8eef8;--panel:rgba(255,255,255,.92);--line:#d7e0ea;--text:#182133;--muted:#607086;--primary:#0f766e;--primary-strong:#115e59;--primary-soft:#e8f7f5;--accent:#f59e0b;--danger:#b42318;--shadow:0 22px 50px rgba(24,33,51,.1)}
       *{box-sizing:border-box}
@@ -1022,12 +1411,18 @@ def home():
       <div class="top hero-card">
         <div class="hero-copy">
           <div class="eyebrow">Production Tracking Workspace</div>
-          <h2 style="margin:0;font-size:clamp(28px,4vw,42px);line-height:1.05">Daily Report Tool</h2>
+          <h2 style="margin:0;font-size:clamp(28px,4vw,42px);line-height:1.05">Daily Report Tool - {{ team_name }}</h2>
           <div class="section-copy">Track live work, manage shift actions, and review one-day output from one cleaner dashboard.</div>
           <div class="hero-badges">
             <span class="date-chip">Date {{ selected_date }}</span>
+            <span class="date-chip">Team {{ team_name }}</span>
             <span class="date-chip">{{ members|length }} Members</span>
             {% if not editable %}<span class="date-chip warn">Read Only View</span>{% endif %}
+          </div>
+          <div class="hero-badges" style="margin-top:10px">
+            {% for t in teams %}
+              <a class="date-chip" href="/?team={{ t.id }}" style="cursor:pointer;{% if t.id == team_id %}background:#e8f7f5;border-color:#86cfc5;{% endif %}"> {{ t.name }} </a>
+            {% endfor %}
           </div>
         </div>
         <div><a href="{{ url_for('admin_login_page') }}" class="nav-btn">Open Admin</a></div>
@@ -1081,6 +1476,8 @@ def home():
     </div>
     <script>
       const taskMeta = {{ task_meta | tojson }};
+      const teamId = "{{ team_id }}";
+      let syncVersion = "{{ sync_version }}";
       const isEditable = {{ "true" if editable else "false" }};
       const appTimeZone = "{{ app_timezone }}";
       let state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
@@ -1165,7 +1562,7 @@ def home():
       async function refreshStatus(){
         const member = document.getElementById("member").value;
         if(!member || !isEditable){ resetState(); renderStatus(); refreshButtons(); refreshSave(); updateSelectionSummary(); return; }
-        const res = await fetch(`/api/member-login-status?member=${encodeURIComponent(member)}`);
+        const res = await fetch(`/api/member-login-status?team=${encodeURIComponent(teamId)}&member=${encodeURIComponent(member)}`);
         const data = await res.json().catch(()=>null);
         if(!res.ok || !data){ setMessage("Unable to load member status.", true); return; }
         const pageToday = document.getElementById("today").value;
@@ -1196,7 +1593,7 @@ def home():
       }
 
       async function postJson(url, body){
-        const res = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+        const res = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ ...body, team: teamId })});
         const data = await res.json().catch(()=>null);
         if(!res.ok) throw new Error(data?.error||"Request failed");
         return data;
@@ -1247,7 +1644,7 @@ def home():
         const member = document.getElementById("reportMember").value;
         const d = document.getElementById("reportDate").value;
         if(!member){ document.getElementById("reportArea").textContent="Select member."; return; }
-        const res = await fetch(`/api/report?member=${encodeURIComponent(member)}&date=${encodeURIComponent(d)}`);
+        const res = await fetch(`/api/report?team=${encodeURIComponent(teamId)}&member=${encodeURIComponent(member)}&date=${encodeURIComponent(d)}`);
         const data = await res.json().catch(()=>null);
         if(!res.ok){ document.getElementById("reportArea").textContent=data?.error||"Failed"; return; }
         const taskTotals = {};
@@ -1284,21 +1681,39 @@ def home():
         }, wait);
       }
 
+      async function refreshTaskVersion(){
+        try{
+          const res = await fetch(`/api/sync-version?team=${encodeURIComponent(teamId)}`);
+          const data = await res.json().catch(()=>null);
+          if(!res.ok || !data?.sync_version) return;
+          if(String(data.sync_version) !== String(syncVersion)){
+            setMessage("Tasks/categories were updated by admin. Refreshing...", false);
+            setTimeout(()=>window.location.reload(), 600);
+            return;
+          }
+        }catch(_e){}
+      }
+
       updateSelectionSummary();
       refreshStatus();
       refreshSave();
       scheduleMidnightSwitch();
       setInterval(()=>{ if(isEditable) refreshStatus(); }, 60000);
+      setInterval(refreshTaskVersion, 15000);
     </script></body></html>
     """
 
     return render_template_string(
         html,
+        team_id=team_id,
+        team_name=next((t["name"] for t in teams if t["id"] == team_id), DEFAULT_TEAM_NAME),
+        teams=teams,
         selected_date=selected_date,
         today=_today_str(),
         editable=editable,
         app_timezone=str(_APP_TZ),
-        members=MEMBER_NAMES,
+        sync_version=f"{_team_tasks_version(team_id)}:{_global_teams_version()}",
+        members=members,
         categories=categories,
         tasks_by_cat=tasks_by_cat,
         estimate_labels=estimate_labels,
@@ -1329,12 +1744,13 @@ def healthz():
 @app.get("/api/member-login-status")
 def member_login_status():
     member = (request.args.get("member") or "").strip()
-    if not _valid_member(member):
+    team_id = _resolve_team_id()
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     entry_date = _today_str()
-    shift = _active_shift_record(member)
+    shift = _active_shift_record(member, team_id)
     active_date = shift.get("entry_date") if shift else entry_date
-    pause = _pause_state_for_member(member, active_date)
+    pause = _pause_state_for_member(member, active_date, team_id)
     return jsonify(
         {
             "today": entry_date,
@@ -1352,97 +1768,102 @@ def member_login_status():
 @app.post("/api/member-login")
 def member_login():
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     entry_date = _today_str()
-    active = _active_shift_record(member)
+    active = _active_shift_record(member, team_id)
     if active and active.get("login_at") and not active.get("logout_at"):
         return jsonify({"ok": True, "already_logged_in": True})
     with _db() as conn:
-        existing = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1", (member, entry_date))
+        existing = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE team_id=%s AND member=%s AND entry_date=%s LIMIT 1", (team_id, member, entry_date))
         if existing:
             return jsonify({"ok": True, "already_logged_in": True, "already_logged_out": bool(existing.get("logout_at"))})
-        _execute(conn, "INSERT INTO member_logins(entry_date, member, login_at, logout_at) VALUES(%s,%s,NOW(),NULL)", (entry_date, member))
+        _execute(conn, "INSERT INTO member_logins(team_id, entry_date, member, login_at, logout_at) VALUES(%s,%s,%s,NOW(),NULL)", (team_id, entry_date, member))
     return jsonify({"ok": True})
 
 
 @app.post("/api/member-pause")
 def member_pause():
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
-    shift = _active_shift_record(member)
+    shift = _active_shift_record(member, team_id)
     if not shift or not shift.get("login_at"):
         return jsonify({"error": "Member must login first."}), 400
     if shift.get("logout_at"):
         return jsonify({"error": "Member already logged out."}), 400
     entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
-        open_row = _fetchone(conn, "SELECT id FROM member_pauses WHERE member=%s AND entry_date=%s AND pause_end IS NULL LIMIT 1", (member, entry_date))
+        open_row = _fetchone(conn, "SELECT id FROM member_pauses WHERE team_id=%s AND member=%s AND entry_date=%s AND pause_end IS NULL LIMIT 1", (team_id, member, entry_date))
         if open_row:
             return jsonify({"ok": True})
-        _execute(conn, "INSERT INTO member_pauses(entry_date, member, pause_start, pause_end) VALUES(%s,%s,NOW(),NULL)", (entry_date, member))
+        _execute(conn, "INSERT INTO member_pauses(team_id, entry_date, member, pause_start, pause_end) VALUES(%s,%s,%s,NOW(),NULL)", (team_id, entry_date, member))
     return jsonify({"ok": True})
 
 
 @app.post("/api/member-resume")
 def member_resume():
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
-    shift = _active_shift_record(member)
+    shift = _active_shift_record(member, team_id)
     if not shift or shift.get("logout_at"):
         return jsonify({"error": "Member is not active."}), 400
     entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
-        _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE member=%s AND entry_date=%s AND pause_end IS NULL", (member, entry_date))
+        _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE team_id=%s AND member=%s AND entry_date=%s AND pause_end IS NULL", (team_id, member, entry_date))
     return jsonify({"ok": True})
 
 
 @app.post("/api/member-logout")
 def member_logout():
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
-    shift = _active_shift_record(member)
+    shift = _active_shift_record(member, team_id)
     if not shift or not shift.get("login_at"):
         return jsonify({"error": "Member must login first."}), 400
     if shift.get("logout_at"):
         return jsonify({"ok": True})
     entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
-        _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE member=%s AND entry_date=%s AND pause_end IS NULL", (member, entry_date))
-        _execute(conn, "UPDATE member_logins SET logout_at=NOW() WHERE member=%s AND entry_date=%s", (member, entry_date))
+        _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE team_id=%s AND member=%s AND entry_date=%s AND pause_end IS NULL", (team_id, member, entry_date))
+        _execute(conn, "UPDATE member_logins SET logout_at=NOW() WHERE team_id=%s AND member=%s AND entry_date=%s", (team_id, member, entry_date))
     return jsonify({"ok": True})
 
 
 @app.post("/api/entries")
 def create_entry():
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
     article = (payload.get("article") or "").strip()
     tasks = payload.get("tasks") or []
     completed = bool(payload.get("completed", True))
 
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     if not article:
         return jsonify({"error": "Article number is required."}), 400
     if not isinstance(tasks, list):
         return jsonify({"error": "Tasks must be a list."}), 400
     try:
-        task_ids = _normalize_task_ids(tasks)
+        task_ids = _normalize_task_ids(tasks, team_id)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     if not task_ids:
         return jsonify({"error": "Select at least one task."}), 400
 
     entry_date = _today_str()
-    shift = _active_shift_record(member)
+    shift = _active_shift_record(member, team_id)
     if not shift or not shift.get("login_at"):
         return jsonify({"error": "Member must login before saving entries."}), 400
     if shift.get("logout_at"):
@@ -1451,8 +1872,8 @@ def create_entry():
     with _db() as conn:
         _execute(
             conn,
-            "INSERT INTO entries(entry_date, member, article, tasks_json, completed, created_at) VALUES(%s,%s,%s,%s,%s,NOW())",
-            (entry_date, member, article, json.dumps(task_ids), completed),
+            "INSERT INTO entries(team_id, entry_date, member, article, tasks_json, completed, created_at) VALUES(%s,%s,%s,%s,%s,%s,NOW())",
+            (team_id, entry_date, member, article, json.dumps(task_ids), completed),
         )
     return jsonify({"ok": True})
 
@@ -1461,14 +1882,15 @@ def create_entry():
 def report():
     member = (request.args.get("member") or "").strip()
     requested_date = request.args.get("date") or _today_str()
-    if not _valid_member(member):
+    team_id = _resolve_team_id()
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     try:
         requested_date = _parse_date(requested_date)
     except Exception:
         return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
 
-    data = _build_member_day_entries(member, requested_date)
+    data = _build_member_day_entries(member, requested_date, team_id)
     pauses = data["pauses"]
     break_seconds = 0
     now_dt = datetime.now()
@@ -1511,6 +1933,19 @@ def report():
             "overtime_total_hours": _hours_value(overtime_min) if overtime_min is not None else None,
         }
     )
+
+
+@app.get("/api/tasks-version")
+def tasks_version():
+    team_id = _resolve_team_id()
+    return jsonify({"team": team_id, "version": _team_tasks_version(team_id, use_cache=False)})
+
+
+@app.get("/api/sync-version")
+def sync_version():
+    team_id = _resolve_team_id()
+    v = f"{_team_tasks_version(team_id, use_cache=False)}:{_global_teams_version(use_cache=False)}"
+    return jsonify({"team": team_id, "sync_version": v})
 
 
 @app.get("/admin/login")
@@ -1576,13 +2011,13 @@ def admin_login_post():
         return jsonify({"error": "Invalid password."}), 401
 
     _admin_login_attempts.pop(key, None)
-    session["admin"] = True
+    _grant_admin_session()
     return jsonify({"ok": True})
 
 
 @app.post("/admin/logout")
 def admin_logout():
-    session.clear()
+    _clear_admin_session()
     return jsonify({"ok": True})
 
 
@@ -1590,11 +2025,12 @@ def admin_logout():
 def admin_reset_login():
     _require_admin()
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
     entry_date = (payload.get("date") or "").strip()
     time_hhmm = (payload.get("time") or "").strip()
 
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     try:
         entry_date = _parse_date(entry_date)
@@ -1610,18 +2046,18 @@ def admin_reset_login():
         return jsonify({"error": "Invalid time. Use HH:MM."}), 400
 
     with _db() as conn:
-        existing = _fetchone(conn, "SELECT id FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1", (member, entry_date))
+        existing = _fetchone(conn, "SELECT id FROM member_logins WHERE team_id=%s AND member=%s AND entry_date=%s LIMIT 1", (team_id, member, entry_date))
         if existing:
             _execute(
                 conn,
-                "UPDATE member_logins SET login_at=%s WHERE member=%s AND entry_date=%s",
-                (login_at, member, entry_date),
+                "UPDATE member_logins SET login_at=%s WHERE team_id=%s AND member=%s AND entry_date=%s",
+                (login_at, team_id, member, entry_date),
             )
         else:
             _execute(
                 conn,
-                "INSERT INTO member_logins(entry_date, member, login_at, logout_at) VALUES(%s,%s,%s,NULL)",
-                (entry_date, member, login_at),
+                "INSERT INTO member_logins(team_id, entry_date, member, login_at, logout_at) VALUES(%s,%s,%s,%s,NULL)",
+                (team_id, entry_date, member, login_at),
             )
 
     return jsonify({"ok": True})
@@ -1631,10 +2067,11 @@ def admin_reset_login():
 def admin_reset_logout():
     _require_admin()
     payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
     member = (payload.get("member") or "").strip()
     entry_date = (payload.get("date") or "").strip()
 
-    if not _valid_member(member):
+    if not _valid_member(member, team_id):
         return jsonify({"error": "Select a valid member."}), 400
     try:
         entry_date = _parse_date(entry_date)
@@ -1642,7 +2079,7 @@ def admin_reset_logout():
         return jsonify({"error": "Invalid date. Use YYYY-MM-DD."}), 400
 
     with _db() as conn:
-        _execute(conn, "UPDATE member_logins SET logout_at=NULL WHERE member=%s AND entry_date=%s", (member, entry_date))
+        _execute(conn, "UPDATE member_logins SET logout_at=NULL WHERE team_id=%s AND member=%s AND entry_date=%s", (team_id, member, entry_date))
 
     return jsonify({"ok": True})
 
@@ -1650,6 +2087,8 @@ def admin_reset_logout():
 @app.get("/admin/search")
 def admin_search():
     _require_admin()
+    team_id = _admin_team_id()
+    teams = _all_teams()
     query = (request.args.get("article") or "").strip()
 
     rows: list[dict] = []
@@ -1660,17 +2099,17 @@ def admin_search():
                 """
                 SELECT DISTINCT entry_date::text AS entry_date, member
                 FROM entries
-                WHERE article ILIKE %s
+                WHERE team_id=%s AND article ILIKE %s
                 ORDER BY entry_date DESC, member
                 """,
-                (f"%{query}%",),
+                (team_id, f"%{query}%"),
             )
 
         now_dt = datetime.now()
         for c in combos:
             member = str(c["member"])
             entry_date = str(c["entry_date"])
-            data = _build_member_day_entries(member, entry_date)
+            data = _build_member_day_entries(member, entry_date, team_id)
 
             break_seconds = 0
             for p in data["pauses"]:
@@ -1698,7 +2137,7 @@ def admin_search():
                         "member": member,
                         "article": e["article"],
                         "completed": bool(e["completed"]),
-                        "task_labels": [_task_label(str(t)) for t in e["tasks"]],
+                        "task_labels": [_task_label(str(t), team_id) for t in e["tasks"]],
                         "spent_label": e["spent_total_label"],
                         "break_label": _minutes_label(break_min),
                     }
@@ -1737,16 +2176,18 @@ def admin_search():
               <div class="muted">Search by article and view all member entries, tasks performed, time and break.</div>
             </div>
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-              <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
-              <a href="{{ url_for('admin_tasks') }}">Tasks &amp; Estimation</a>
-              <a href="{{ url_for('admin_efficiency') }}">Member Efficiency</a>
-              <a href="{{ url_for('home') }}">Home</a>
+              <select id="teamSel">{% for t in teams %}<option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>{% endfor %}</select>
+              <a href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a href="{{ url_for('admin_tasks') }}?team={{ team_id }}">Tasks &amp; Estimation</a>
+              <a href="{{ url_for('admin_efficiency') }}?team={{ team_id }}">Member Efficiency</a>
+              <a href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
               <button type="button" id="logoutBtn" class="secondary" style="background:#e2e8f0;color:#0f172a;">Logout</button>
             </div>
           </div>
 
           <div class="card">
             <form method="GET" action="{{ url_for('admin_search') }}">
+              <input type="hidden" name="team" value="{{ team_id }}" />
               <input type="text" name="article" value="{{ query }}" placeholder="Enter article number (full or partial)" />
               <button type="submit">Search</button>
             </form>
@@ -1803,6 +2244,11 @@ def admin_search():
           {% endif %}
         </div>
         <script>
+          document.getElementById("teamSel").addEventListener("change", () => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("team", document.getElementById("teamSel").value);
+            window.location.href = url.toString();
+          });
           document.getElementById("logoutBtn").addEventListener("click", async () => {
             await fetch("/admin/logout", { method: "POST" });
             window.location.href = "/admin/login";
@@ -1811,20 +2257,40 @@ def admin_search():
       </body>
     </html>
     """
-    return render_template_string(html, query=query, rows=rows)
+    return render_template_string(html, team_id=team_id, teams=teams, query=query, rows=rows)
 
 
 @app.get("/admin/tasks")
 def admin_tasks():
     _require_admin()
+    team_id = _admin_team_id()
+    teams = _all_teams()
+    selected_name = next((t["name"] for t in teams if t["id"] == team_id), DEFAULT_TEAM_NAME)
     with _db() as conn:
-        categories = [str(r["name"]) for r in _fetchall(conn, "SELECT name FROM task_categories ORDER BY name")]
-        tasks = _fetchall(conn, "SELECT id, label, estimate, category, active FROM tasks ORDER BY category, label")
+        all_categories = [str(r["name"]) for r in _fetchall(conn, "SELECT name FROM task_categories ORDER BY name")]
+        tasks = _fetchall(conn, "SELECT id, label, estimate, category, active FROM tasks WHERE team_id=%s ORDER BY category, label", (team_id,))
 
-    tasks_view = [
-        {"id": str(t["id"]), "label": str(t["label"]), "estimate": int(t["estimate"]), "category": str(t["category"]), "active": bool(t["active"])}
-        for t in tasks
-    ]
+    prefix = _team_prefix(team_id)
+    if team_id == DEFAULT_TEAM_ID:
+        categories = [_team_unscoped_value(c, DEFAULT_TEAM_ID) for c in all_categories if ("::" not in c or c.startswith(prefix))]
+    else:
+        categories = [_team_unscoped_value(c, team_id) for c in all_categories if c.startswith(prefix)]
+
+    tasks_view = []
+    for t in tasks:
+        tid = str(t["id"])
+        cat = str(t["category"])
+        tasks_view.append(
+            {
+                "id": tid,
+                "display_id": _team_unscoped_value(tid, team_id),
+                "label": str(t["label"]),
+                "estimate": int(t["estimate"]),
+                "category": cat,
+                "display_category": _team_unscoped_value(cat, team_id),
+                "active": bool(t["active"]),
+            }
+        )
 
     html = """
     <!doctype html>
@@ -1832,7 +2298,7 @@ def admin_tasks():
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Tasks & Estimation</title>
+        <title>Tasks & Estimation - {{ selected_name }}</title>
         <style>
           * { box-sizing: border-box; }
           body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 28px 16px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
@@ -1861,17 +2327,34 @@ def admin_tasks():
               <div class="muted">Admin can create categories, create tasks, and update estimations (minutes).</div>
             </div>
             <div class="inline">
-              <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
-              <a href="{{ url_for('admin_search') }}">Admin Search</a>
-              <a href="{{ url_for('admin_efficiency') }}">Member Efficiency</a>
-              <a href="{{ url_for('home') }}">Home</a>
+              <select id="teamSel">{% for t in teams %}<option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>{% endfor %}</select>
+              <a href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a href="{{ url_for('admin_search') }}?team={{ team_id }}">Admin Search</a>
+              <a href="{{ url_for('admin_efficiency') }}?team={{ team_id }}">Member Efficiency</a>
+              <a href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
               <a href="#" id="logoutBtn">Logout</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 style="margin:0 0 8px; font-size: 16px;">Manage Categories</h2>
+            <div class="muted">Deleting a category will permanently remove category and tasks for this team. Old saved entries stay unchanged.</div>
+            <div class="inline" style="margin-top: 10px; flex-wrap: wrap;">
+              {% for c in categories %}
+                <form method="POST" action="/admin/categories/delete" class="inline delete-category-form" style="margin: 0;">
+                  <input type="hidden" name="team" value="{{ team_id }}" />
+                  <input type="hidden" name="name" value="{{ c }}" />
+                  <span class="muted" style="font-weight:700;">{{ c }}</span>
+                  <button type="submit" style="background:#ef4444;">Delete</button>
+                </form>
+              {% endfor %}
             </div>
           </div>
 
           <div class="card">
             <h2 style="margin:0 0 8px; font-size: 16px;">Add Category</h2>
             <form method="POST" action="/admin/categories/add" class="inline">
+              <input type="hidden" name="team" value="{{ team_id }}" />
               <input type="text" name="name" placeholder="Category name" required />
               <button type="submit">Add</button>
             </form>
@@ -1880,6 +2363,7 @@ def admin_tasks():
           <div class="card">
             <h2 style="margin:0 0 8px; font-size: 16px;">Add Task</h2>
             <form method="POST" action="/admin/tasks/add">
+              <input type="hidden" name="team" value="{{ team_id }}" />
               <div class="grid">
                 <div class="row"><label>Task ID</label><input type="text" name="id" placeholder="example: new_task_id" required /></div>
                 <div class="row"><label>Label</label><input type="text" name="label" placeholder="Task display name" required /></div>
@@ -1899,10 +2383,22 @@ def admin_tasks():
 
           <div class="card">
             <h2 style="margin:0 0 8px; font-size: 16px;">Existing Tasks</h2>
-            <div class="muted">Edit label/estimate/category/active and save.</div>
+            <div class="muted">Edit label/estimate/category/active and save. Bulk actions work with the checkboxes.</div>
+            <div class="inline" style="margin-top: 10px;">
+              <button type="button" id="bulkAll" style="background:#0f766e;">Select all</button>
+              <button type="button" id="bulkNone" style="background:#64748b;">Select none</button>
+              <select id="bulkAction">
+                <option value="activate">Set Active</option>
+                <option value="deactivate">Set Inactive</option>
+                <option value="delete">Delete Permanently</option>
+              </select>
+              <button type="button" id="bulkApply" style="background:#0f766e;">Apply</button>
+              <span class="muted" id="bulkMsg"></span>
+            </div>
             <table>
               <thead>
                 <tr>
+                  <th style="width:36px;"><input type="checkbox" id="bulkHead" /></th>
                   <th>Task ID</th>
                   <th>Label</th>
                   <th>Estimate (min)</th>
@@ -1915,12 +2411,16 @@ def admin_tasks():
                 {% for t in tasks %}
                   <tr>
                     <form method="POST" action="/admin/tasks/update">
-                      <td>{{ t.id }}<input type="hidden" name="id" value="{{ t.id }}" /></td>
+                      <td><input type="checkbox" class="bulkBox" data-id="{{ t.id }}" /></td>
+                      <td>{{ t.display_id }}<input type="hidden" name="id" value="{{ t.id }}" /><input type="hidden" name="team" value="{{ team_id }}" /></td>
                       <td><input type="text" name="label" value="{{ t.label }}" required /></td>
                       <td><input type="number" min="0" name="estimate" value="{{ t.estimate }}" required /></td>
-                      <td><select name="category">{% for c in categories %}<option value="{{ c }}" {% if c == t.category %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></td>
+                      <td><select name="category">{% for c in categories %}<option value="{{ c }}" {% if c == t.display_category %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></td>
                       <td style="width:110px;"><select name="active"><option value="1" {% if t.active %}selected{% endif %}>Yes</option><option value="0" {% if not t.active %}selected{% endif %}>No</option></select></td>
-                      <td style="width:120px;"><button type="submit">Save</button></td>
+                      <td style="width:220px;display:flex;gap:8px;">
+                        <button type="submit">Save</button>
+                        <button type="button" class="delete-task-btn" data-id="{{ t.id }}" style="background:#ef4444;">Delete</button>
+                      </td>
                     </form>
                   </tr>
                 {% endfor %}
@@ -1929,41 +2429,131 @@ def admin_tasks():
           </div>
         </div>
         <script>
+          document.getElementById("teamSel").addEventListener("change", () => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("team", document.getElementById("teamSel").value);
+            window.location.href = url.toString();
+          });
+
           document.getElementById("logoutBtn").addEventListener("click", async (e) => {
             e.preventDefault();
             await fetch("/admin/logout", { method: "POST" });
             window.location.href = "/admin/login";
           });
+
+          function selectedIds(){
+            return Array.from(document.querySelectorAll(".bulkBox")).filter(b=>b.checked).map(b=>b.dataset.id);
+          }
+          function setAll(val){
+            Array.from(document.querySelectorAll(".bulkBox")).forEach(b=>b.checked=val);
+            document.getElementById("bulkHead").checked = val;
+          }
+          document.getElementById("bulkAll").addEventListener("click", ()=>setAll(true));
+          document.getElementById("bulkNone").addEventListener("click", ()=>setAll(false));
+          document.getElementById("bulkHead").addEventListener("change", (e)=>setAll(!!e.target.checked));
+          document.getElementById("bulkApply").addEventListener("click", async ()=>{
+            const ids = selectedIds();
+            const action = document.getElementById("bulkAction").value;
+            const msg = document.getElementById("bulkMsg");
+            if(!ids.length){ msg.textContent = "Select at least one task."; return; }
+            if(action === "delete" && !confirm(`Delete ${ids.length} selected task(s) permanently for this team?`)){ return; }
+            msg.textContent = "Applying...";
+            const res = await fetch("/admin/tasks/bulk", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ team: "{{ team_id }}", action, ids }) });
+            if(!res.ok){
+              const data = await res.json().catch(()=>null);
+              msg.textContent = data?.error || "Failed.";
+              return;
+            }
+            window.location.reload();
+          });
+          document.querySelectorAll(".delete-category-form").forEach((form) => {
+            form.addEventListener("submit", (e) => {
+              const name = form.querySelector("input[name='name']")?.value || "this category";
+              if(!confirm(`Delete category "${name}" and all tasks in it for this team?`)){
+                e.preventDefault();
+              }
+            });
+          });
+          document.querySelectorAll(".delete-task-btn").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+              const id = btn.dataset.id || "this task";
+              if(!confirm(`Delete task "${id}" permanently for this team?`)){ return; }
+              const form = document.createElement("form");
+              form.method = "POST";
+              form.action = "/admin/tasks/delete";
+              form.style.display = "none";
+              const team = document.createElement("input");
+              team.type = "hidden";
+              team.name = "team";
+              team.value = "{{ team_id }}";
+              const tid = document.createElement("input");
+              tid.type = "hidden";
+              tid.name = "id";
+              tid.value = id;
+              form.appendChild(team);
+              form.appendChild(tid);
+              document.body.appendChild(form);
+              form.submit();
+            });
+          });
         </script>
       </body>
     </html>
     """
-    return render_template_string(html, categories=categories, tasks=tasks_view)
+    return render_template_string(html, team_id=team_id, teams=teams, selected_name=selected_name, categories=categories, tasks=tasks_view)
 
 
 @app.post("/admin/categories/add")
 def admin_add_category():
     _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
     name = (request.form.get("name") or "").strip()
     if not name:
-        return redirect(url_for("admin_tasks"))
-    with _db() as conn:
-        _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (name,))
-    return redirect(url_for("admin_tasks"))
+        return redirect(url_for("admin_tasks", team=team_id))
+    name_store = _team_scoped_value(name, team_id)
+    try:
+        with _db() as conn:
+            _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (name_store,))
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_add_category_failed")
+    return redirect(url_for("admin_tasks", team=team_id))
+
+
+@app.post("/admin/categories/delete")
+def admin_delete_category():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        return redirect(url_for("admin_tasks", team=team_id))
+    category_store = _team_scoped_value(name, team_id)
+    try:
+        with _db() as conn:
+            _execute(conn, "DELETE FROM tasks WHERE team_id=%s AND category=%s", (team_id, category_store))
+            used = _fetchone(conn, "SELECT COUNT(1) AS c FROM tasks WHERE category=%s", (category_store,))
+            if not used or int(used["c"]) == 0:
+                _execute(conn, "DELETE FROM task_categories WHERE name=%s", (category_store,))
+        _task_cache.clear()
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_delete_category_failed")
+    return redirect(url_for("admin_tasks", team=team_id))
 
 
 @app.post("/admin/tasks/add")
 def admin_add_task():
     _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
     tid = (request.form.get("id") or "").strip()
     label = (request.form.get("label") or "").strip()
     estimate_raw = (request.form.get("estimate") or "0").strip()
     category = (request.form.get("new_category") or "").strip() or (request.form.get("category") or "").strip()
 
     if not tid or not label or not category:
-        return redirect(url_for("admin_tasks"))
+        return redirect(url_for("admin_tasks", team=team_id))
     if not all(ch.isalnum() or ch == "_" for ch in tid):
-        return redirect(url_for("admin_tasks"))
+        return redirect(url_for("admin_tasks", team=team_id))
     try:
         estimate = int(estimate_raw)
     except Exception:
@@ -1971,24 +2561,38 @@ def admin_add_task():
     if estimate < 0:
         estimate = 0
 
-    with _db() as conn:
-        _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (category,))
-        _execute(
-            conn,
-            """
-            INSERT INTO tasks(id, label, estimate, category, active)
-            VALUES(%s,%s,%s,%s,TRUE)
-            ON CONFLICT (id)
-            DO UPDATE SET label=EXCLUDED.label, estimate=EXCLUDED.estimate, category=EXCLUDED.category, active=TRUE
-            """,
-            (tid, label, estimate, category),
-        )
-    return redirect(url_for("admin_tasks"))
+    tid_store = _team_scoped_value(tid, team_id)
+    category_store = _team_scoped_value(category, team_id)
+    try:
+        with _db() as conn:
+            _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (category_store,))
+            if _use_postgres():
+                _execute(
+                    conn,
+                    """
+                    INSERT INTO tasks(id, team_id, label, estimate, category, active)
+                    VALUES(%s,%s,%s,%s,%s,TRUE)
+                    ON CONFLICT (id)
+                    DO UPDATE SET team_id=EXCLUDED.team_id, label=EXCLUDED.label, estimate=EXCLUDED.estimate, category=EXCLUDED.category, active=TRUE
+                    """,
+                    (tid_store, team_id, label, estimate, category_store),
+                )
+            else:
+                _execute(
+                    conn,
+                    "INSERT OR REPLACE INTO tasks(id, team_id, label, estimate, category, active) VALUES(?,?,?,?,?,1)",
+                    (tid_store, team_id, label, estimate, category_store),
+                )
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_add_task_failed")
+    return redirect(url_for("admin_tasks", team=team_id))
 
 
 @app.post("/admin/tasks/update")
 def admin_update_task():
     _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
     tid = (request.form.get("id") or "").strip()
     label = (request.form.get("label") or "").strip()
     estimate_raw = (request.form.get("estimate") or "0").strip()
@@ -1996,7 +2600,7 @@ def admin_update_task():
     active_raw = (request.form.get("active") or "1").strip()
 
     if not tid or not label or not category:
-        return redirect(url_for("admin_tasks"))
+        return redirect(url_for("admin_tasks", team=team_id))
     try:
         estimate = int(estimate_raw)
     except Exception:
@@ -2005,15 +2609,361 @@ def admin_update_task():
         estimate = 0
     active = active_raw == "1"
 
+    category_store = _team_scoped_value(category, team_id)
+    try:
+        with _db() as conn:
+            _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (category_store,))
+            active_val = active if _use_postgres() else (1 if active else 0)
+            _execute(conn, "UPDATE tasks SET label=%s, estimate=%s, category=%s, active=%s WHERE team_id=%s AND id=%s", (label, estimate, category_store, active_val, team_id, tid))
+        _task_cache.clear()
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_update_task_failed")
+    return redirect(url_for("admin_tasks", team=team_id))
+
+
+@app.post("/admin/tasks/bulk")
+def admin_tasks_bulk():
+    _require_admin()
+    payload = request.get_json(silent=True) or {}
+    team_id = _resolve_team_id(payload)
+    action = str(payload.get("action") or "").strip().lower()
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "No tasks selected."}), 400
+    task_ids = [str(x) for x in ids if isinstance(x, str) and x.strip()]
+    if not task_ids:
+        return jsonify({"error": "No valid task ids."}), 400
+
+    if action not in {"activate", "deactivate", "delete"}:
+        return jsonify({"error": "Invalid action."}), 400
+    try:
+        with _db() as conn:
+            if action == "delete":
+                for tid in task_ids:
+                    _execute(conn, "DELETE FROM tasks WHERE team_id=%s AND id=%s", (team_id, tid))
+                cats = _fetchall(conn, "SELECT name FROM task_categories")
+                for c in cats:
+                    name = str(c["name"])
+                    left = _fetchone(conn, "SELECT COUNT(1) AS c FROM tasks WHERE category=%s", (name,))
+                    if not left or int(left["c"]) == 0:
+                        _execute(conn, "DELETE FROM task_categories WHERE name=%s", (name,))
+            else:
+                active = True if action == "activate" else False
+                active_val = active if _use_postgres() else (1 if active else 0)
+                for tid in task_ids:
+                    _execute(conn, "UPDATE tasks SET active=%s WHERE team_id=%s AND id=%s", (active_val, team_id, tid))
+        _task_cache.clear()
+        _bump_team_tasks_version(team_id)
+        return jsonify({"ok": True})
+    except Exception:
+        app.logger.exception("admin_tasks_bulk_failed")
+        return jsonify({"error": "Bulk operation failed. No changes were committed."}), 500
+
+
+@app.post("/admin/tasks/delete")
+def admin_delete_task():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    tid = (request.form.get("id") or "").strip()
+    if not tid:
+        return redirect(url_for("admin_tasks", team=team_id))
+    try:
+        with _db() as conn:
+            row = _fetchone(conn, "SELECT category FROM tasks WHERE team_id=%s AND id=%s", (team_id, tid))
+            _execute(conn, "DELETE FROM tasks WHERE team_id=%s AND id=%s", (team_id, tid))
+            if row and row.get("category"):
+                cat = str(row["category"])
+                used = _fetchone(conn, "SELECT COUNT(1) AS c FROM tasks WHERE category=%s", (cat,))
+                if not used or int(used["c"]) == 0:
+                    _execute(conn, "DELETE FROM task_categories WHERE name=%s", (cat,))
+        _task_cache.clear()
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_delete_task_failed")
+    return redirect(url_for("admin_tasks", team=team_id))
+
+
+@app.get("/admin/teams")
+def admin_teams():
+    _require_admin()
+    team_id = _admin_team_id()
+    teams = _all_teams()
+    selected_name = next((t["name"] for t in teams if t["id"] == team_id), DEFAULT_TEAM_NAME)
+    members = _team_members(team_id)
+    html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Teams</title>
+        <style>
+          * { box-sizing: border-box; }
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px 14px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
+          .wrap { max-width: 1100px; margin: 0 auto; }
+          .top { display:flex; justify-content: space-between; align-items: center; gap:10px; flex-wrap: wrap; }
+          .card { border: 1px solid #dbe3ee; border-radius: 16px; padding: 16px; margin-top: 12px; background: #fff; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05); }
+          .muted { color: #64748b; font-size: 12px; line-height: 1.55; }
+          .row { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+          input, select { padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 12px; font-size: 14px; outline: none; background: #fff; }
+          button { padding: 10px 12px; border: none; border-radius: 12px; cursor: pointer; background: linear-gradient(135deg, #0f766e, #115e59); color: #fff; font-size: 14px; font-weight: 800; }
+          a { background: #e2e8f0; color: #0f172a; text-decoration: none; border-radius: 12px; padding: 10px 12px; font-weight: 700; border: 1px solid #cbd5e1; display: inline-block; }
+          table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          th, td { text-align: left; border-bottom: 1px solid #edf2f7; padding: 8px 6px; font-size: 13px; vertical-align: top; }
+          th { font-size: 12px; color: #334155; background: #f8fafc; }
+          .pill { display:inline-flex; gap:8px; align-items:center; padding: 8px 12px; border-radius: 999px; border: 1px solid #e2e8f0; background: #fbfdff; font-weight: 800; font-size: 12px; }
+          .danger { background: #fee2e2; border-color: #fecaca; color: #7f1d1d; }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="top">
+            <div>
+              <h1 style="font-size: 20px; margin: 0;">Teams</h1>
+              <div class="muted">Create teams and manage members. Tasks, exports and reports are scoped by team.</div>
+            </div>
+            <div class="row">
+              <a href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="row" style="justify-content: space-between;">
+              <div class="pill">Selected Team: {{ selected_name }} ({{ team_id }})</div>
+              <form class="row" method="GET" action="{{ url_for('admin_teams') }}">
+                <select name="team">
+                  {% for t in teams %}
+                    <option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>
+                  {% endfor %}
+                </select>
+                <button type="submit">Switch</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2 style="margin:0 0 8px; font-size: 16px;">All Teams</h2>
+            <div class="muted">Rename any team here. Team ID stays the same.</div>
+            <table>
+              <thead><tr><th>Team ID</th><th>Team Name</th><th></th></tr></thead>
+              <tbody>
+                {% for t in teams %}
+                  <tr>
+                    <td style="width:220px;">{{ t.id }}</td>
+                    <td>
+                      <form method="POST" action="{{ url_for('admin_team_rename') }}" class="row" style="margin:0;">
+                        <input type="hidden" name="team" value="{{ t.id }}" />
+                        <input type="text" name="name" value="{{ t.name }}" required />
+                        <button type="submit">Save</button>
+                      </form>
+                    </td>
+                    <td style="width:140px;">
+                      <a href="{{ url_for('admin_teams') }}?team={{ t.id }}">Open</a>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2 style="margin:0 0 8px; font-size: 16px;">Create Team</h2>
+            <form method="POST" action="{{ url_for('admin_team_create') }}" class="row">
+              <input type="text" name="name" placeholder="Team name (e.g. Team A)" required />
+              <button type="submit">Create</button>
+            </form>
+            <div class="muted" style="margin-top: 10px;">New teams start with a copy of Default team tasks.</div>
+          </div>
+
+          <div class="card">
+            <h2 style="margin:0 0 8px; font-size: 16px;">Members ({{ members|length }})</h2>
+            <form method="POST" action="{{ url_for('admin_team_member_add') }}" class="row">
+              <input type="hidden" name="team" value="{{ team_id }}" />
+              <input type="text" name="member" placeholder="Member full name" required />
+              <button type="submit">Add Member</button>
+            </form>
+            <table>
+              <thead><tr><th>Member</th><th></th></tr></thead>
+              <tbody>
+                {% for m in members %}
+                  <tr>
+                    <td>{{ m }}</td>
+                    <td style="width:140px;">
+                      <form method="POST" action="{{ url_for('admin_team_member_remove') }}">
+                        <input type="hidden" name="team" value="{{ team_id }}" />
+                        <input type="hidden" name="member" value="{{ m }}" />
+                        <button class="danger" type="submit" style="background:#ef4444;">Remove</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <h2 style="margin:0 0 8px; font-size: 16px;">Delete Team</h2>
+            <div class="muted">Delete is blocked if the team has any saved data.</div>
+            <form method="POST" action="{{ url_for('admin_team_delete') }}" class="row">
+              <input type="hidden" name="team" value="{{ team_id }}" />
+              <button type="submit" style="background:#ef4444;">Delete Selected Team</button>
+            </form>
+            {% if team_id == default_team_id %}
+              <div class="muted" style="margin-top: 10px;">Default team cannot be deleted.</div>
+            {% endif %}
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return render_template_string(html, team_id=team_id, selected_name=selected_name, teams=teams, members=members, default_team_id=DEFAULT_TEAM_ID)
+
+
+@app.post("/admin/teams/create")
+def admin_team_create():
+    _require_admin()
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        return redirect(url_for("admin_teams", team=DEFAULT_TEAM_ID))
+    tid = _normalize_team_id(name)
+    try:
+        with _db() as conn:
+            existing_name = _fetchone(conn, "SELECT id FROM teams WHERE name=%s LIMIT 1", (name,))
+            if existing_name:
+                return redirect(url_for("admin_teams", team=str(existing_name["id"])))
+            existing = _fetchone(conn, "SELECT id FROM teams WHERE id=%s LIMIT 1", (tid,))
+            if existing:
+                tid = f"{tid}-{secrets.token_hex(2)}"
+            try:
+                _execute(conn, _sql("INSERT INTO teams(id, name) VALUES(%s,%s)", "INSERT INTO teams(id, name) VALUES(?,?)"), (tid, name))
+            except Exception:
+                existing_name2 = _fetchone(conn, "SELECT id FROM teams WHERE name=%s LIMIT 1", (name,))
+                if existing_name2:
+                    return redirect(url_for("admin_teams", team=str(existing_name2["id"])))
+                return redirect(url_for("admin_teams", team=DEFAULT_TEAM_ID))
+            rows = _fetchall(conn, "SELECT id, label, estimate, category, active FROM tasks WHERE team_id=%s", (DEFAULT_TEAM_ID,))
+            for r in rows:
+                raw_id = str(r["id"])
+                new_id = _team_scoped_value(_team_unscoped_value(raw_id, DEFAULT_TEAM_ID), tid)
+                cat_store = _team_scoped_value(_team_unscoped_value(str(r["category"]), DEFAULT_TEAM_ID), tid)
+                _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (cat_store,))
+                if _use_postgres():
+                    _execute(
+                        conn,
+                        "INSERT INTO tasks(id, team_id, label, estimate, category, active) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (new_id, tid, str(r["label"]), int(r["estimate"]), cat_store, bool(r["active"])),
+                    )
+                else:
+                    _execute(
+                        conn,
+                        "INSERT OR IGNORE INTO tasks(id, team_id, label, estimate, category, active) VALUES(?,?,?,?,?,?)",
+                        (new_id, tid, str(r["label"]), int(r["estimate"]), cat_store, int(r["active"])),
+                    )
+            _execute(
+                conn,
+                _sql(
+                    "INSERT INTO app_state(key, value, updated_at) VALUES(%s,%s,NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+                    "INSERT INTO app_state(key, value, updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+                ),
+                (f"tasks_version:{tid}", str(int(time.time() * 1000))),
+            )
+        _task_cache.clear()
+        _bump_global_teams_version()
+    except Exception:
+        app.logger.exception("admin_team_create_failed")
+    return redirect(url_for("admin_teams", team=tid))
+
+
+@app.post("/admin/teams/rename")
+def admin_team_rename():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    name = (request.form.get("name") or "").strip()
+    if not name:
+        return redirect(url_for("admin_teams", team=team_id))
     with _db() as conn:
-        _execute(conn, _sql("INSERT INTO task_categories(name) VALUES(%s) ON CONFLICT DO NOTHING", "INSERT OR IGNORE INTO task_categories(name) VALUES(?)"), (category,))
-        _execute(conn, "UPDATE tasks SET label=%s, estimate=%s, category=%s, active=%s WHERE id=%s", (label, estimate, category, active, tid))
-    return redirect(url_for("admin_tasks"))
+        try:
+            _execute(conn, "UPDATE teams SET name=%s WHERE id=%s", (name, team_id))
+        except Exception:
+            return redirect(url_for("admin_teams", team=team_id))
+    _bump_global_teams_version()
+    return redirect(url_for("admin_teams", team=team_id))
+
+
+@app.post("/admin/teams/members/add")
+def admin_team_member_add():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    member = (request.form.get("member") or "").strip()
+    if not member:
+        return redirect(url_for("admin_teams", team=team_id))
+    try:
+        with _db() as conn:
+            if _use_postgres():
+                _execute(
+                    conn,
+                    "INSERT INTO team_members(team_id, member, active) VALUES(%s,%s,TRUE) ON CONFLICT (team_id, member) DO UPDATE SET active=TRUE",
+                    (team_id, member),
+                )
+            else:
+                _execute(conn, "INSERT OR REPLACE INTO team_members(team_id, member, active) VALUES(?,?,1)", (team_id, member))
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_team_member_add_failed")
+    return redirect(url_for("admin_teams", team=team_id))
+
+
+@app.post("/admin/teams/members/remove")
+def admin_team_member_remove():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    member = (request.form.get("member") or "").strip()
+    if not member:
+        return redirect(url_for("admin_teams", team=team_id))
+    try:
+        with _db() as conn:
+            _execute(conn, "UPDATE team_members SET active=FALSE WHERE team_id=%s AND member=%s", (team_id, member))
+        _bump_team_tasks_version(team_id)
+    except Exception:
+        app.logger.exception("admin_team_member_remove_failed")
+    return redirect(url_for("admin_teams", team=team_id))
+
+
+@app.post("/admin/teams/delete")
+def admin_team_delete():
+    _require_admin()
+    team_id = _resolve_team_id({"team": request.form.get("team")})
+    if team_id == DEFAULT_TEAM_ID:
+        return redirect(url_for("admin_teams", team=team_id))
+    try:
+        with _db() as conn:
+            counts = [
+                _fetchone(conn, "SELECT COUNT(1) AS c FROM entries WHERE team_id=%s", (team_id,)),
+                _fetchone(conn, "SELECT COUNT(1) AS c FROM member_logins WHERE team_id=%s", (team_id,)),
+                _fetchone(conn, "SELECT COUNT(1) AS c FROM member_pauses WHERE team_id=%s", (team_id,)),
+            ]
+            if any(int(r["c"]) > 0 for r in counts if r):
+                return redirect(url_for("admin_teams", team=team_id))
+            _execute(conn, "DELETE FROM tasks WHERE team_id=%s", (team_id,))
+            prefix = _team_prefix(team_id)
+            _execute(conn, _sql("DELETE FROM task_categories WHERE name LIKE %s", "DELETE FROM task_categories WHERE name LIKE ?"), (prefix + "%",))
+            _execute(conn, "DELETE FROM team_members WHERE team_id=%s", (team_id,))
+            _execute(conn, "DELETE FROM teams WHERE id=%s", (team_id,))
+        _task_cache.clear()
+        _bump_global_teams_version()
+    except Exception:
+        app.logger.exception("admin_team_delete_failed")
+    return redirect(url_for("admin_teams", team=DEFAULT_TEAM_ID))
 
 
 @app.get("/admin/efficiency")
 def admin_efficiency():
     _require_admin()
+    team_id = _admin_team_id()
+    teams = _all_teams()
+    selected_name = next((t["name"] for t in teams if t["id"] == team_id), DEFAULT_TEAM_NAME)
     period = (request.args.get("period") or "day").strip().lower()
     if period not in {"day", "week", "month"}:
         period = "day"
@@ -2042,7 +2992,7 @@ def admin_efficiency():
     team_overtime = 0.0
     team_tasks = 0
 
-    for member in MEMBER_NAMES:
+    for member in _team_members(team_id):
         used_min = 0.0
         break_min = 0.0
         task_count = 0
@@ -2053,10 +3003,10 @@ def admin_efficiency():
         per_task_articles: dict[str, set[str]] = {}
 
         for d in day_list:
-            rec = _member_login_record_for_date(member, d)
+            rec = _member_login_record_for_date(member, d, team_id)
             if rec and rec.get("login_at"):
                 login_days += 1
-            data = _build_member_day_entries(member, d)
+            data = _build_member_day_entries(member, d, team_id)
             used_min += float(data["productive_min"])
 
             pauses = data["pauses"]
@@ -2117,7 +3067,7 @@ def admin_efficiency():
             task_breakdown_rows.append(
                 {
                     "member": member,
-                    "task": _task_label(tid),
+                    "task": _task_label(tid, team_id),
                     "articles": len(per_task_articles.get(tid, set())),
                     "count": count,
                     "total_label": _minutes_label(total),
@@ -2142,7 +3092,7 @@ def admin_efficiency():
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Member Efficiency</title>
+        <title>Member Efficiency - {{ selected_name }}</title>
         <style>
           * { box-sizing: border-box; }
           body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 28px 16px; color: #0f172a; background: radial-gradient(circle at 0% 0%, #eef4ff 0, #f8fbff 30%, #f6f8fc 100%); }
@@ -2168,16 +3118,18 @@ def admin_efficiency():
               <div class="muted">{{ period_label }} | Range: {{ start_date }} to {{ end_date }}</div>
             </div>
             <div class="inline">
-              <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
-              <a href="{{ url_for('admin_tasks') }}">Tasks &amp; Estimation</a>
-              <a href="{{ url_for('admin_search') }}">Admin Search</a>
-              <a href="{{ url_for('home') }}">Home</a>
+              <select id="teamSel">{% for t in teams %}<option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>{% endfor %}</select>
+              <a href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a href="{{ url_for('admin_tasks') }}?team={{ team_id }}">Tasks &amp; Estimation</a>
+              <a href="{{ url_for('admin_search') }}?team={{ team_id }}">Admin Search</a>
+              <a href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
               <a href="#" id="logoutBtn">Logout</a>
             </div>
           </div>
 
           <div class="card">
             <form method="GET" action="{{ url_for('admin_efficiency') }}" class="inline">
+              <input type="hidden" name="team" value="{{ team_id }}" />
               <input type="date" name="date" value="{{ selected_date }}" />
               <select name="period">
                 <option value="day" {% if period == 'day' %}selected{% endif %}>Per Day</option>
@@ -2258,6 +3210,11 @@ def admin_efficiency():
           </div>
         </div>
         <script>
+          document.getElementById("teamSel").addEventListener("change", () => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("team", document.getElementById("teamSel").value);
+            window.location.href = url.toString();
+          });
           document.getElementById("logoutBtn").addEventListener("click", async (e) => {
             e.preventDefault();
             await fetch("/admin/logout", { method: "POST" });
@@ -2270,6 +3227,9 @@ def admin_efficiency():
 
     return render_template_string(
         html,
+        team_id=team_id,
+        teams=teams,
+        selected_name=selected_name,
         period=period,
         period_label=period_label,
         selected_date=selected_date,
@@ -2293,6 +3253,7 @@ def admin_efficiency():
 @app.get("/admin/report")
 def admin_report():
     _require_admin()
+    team_id = _admin_team_id()
     selected_date = request.args.get("date") or _today_str()
     try:
         selected_date = _parse_date(selected_date)
@@ -2301,7 +3262,8 @@ def admin_report():
 
     is_today = selected_date == _today_str()
     if not is_today:
-        cached = _admin_report_cache.get(selected_date)
+        cache_key = f"{team_id}:{selected_date}"
+        cached = _admin_report_cache.get(cache_key)
         if cached and (time.time() - cached[0]) < _ADMIN_REPORT_CACHE_TTL_SECONDS:
             return cached[1]
     now_dt = datetime.now()
@@ -2310,8 +3272,9 @@ def admin_report():
     team_used = 0.0
     team_break = 0.0
 
-    for member in MEMBER_NAMES:
-        data = _build_member_day_entries(member, selected_date)
+    members = _team_members(team_id)
+    for member in members:
+        data = _build_member_day_entries(member, selected_date, team_id)
         entries = data["entries"]
         used_min = float(data["productive_min"])
         pauses = data["pauses"]
@@ -2330,7 +3293,7 @@ def admin_report():
                 break_seconds += int((e - s).total_seconds())
         break_min = float(break_seconds) / 60.0
 
-        login_rec = _member_login_record_for_date(member, selected_date)
+        login_rec = _member_login_record_for_date(member, selected_date, team_id)
         login_at = login_rec.get("login_at") if login_rec else None
         logout_at = login_rec.get("logout_at") if login_rec else None
 
@@ -2365,7 +3328,7 @@ def admin_report():
         team_used += used_min
         team_break += break_min
 
-    task_label_map = {t.id: t.label for t in _current_tasks(active_only=False)}
+    task_label_map = {t.id: t.label for t in _current_tasks(team_id=team_id, active_only=False)}
     for legacy_id, legacy_data in LEGACY_TASKS.items():
         task_label_map[legacy_id] = str(legacy_data["label"])
 
@@ -2415,6 +3378,11 @@ def admin_report():
               </div>
             </div>
             <div class="inline">
+              <select id="teamSel">
+                {% for t in teams %}
+                  <option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>
+                {% endfor %}
+              </select>
               <input id="d" type="date" value="{{ selected_date }}" max="{{ today }}" />
               <select id="statusFilter">
                 <option value="all">All Status</option>
@@ -2423,14 +3391,15 @@ def admin_report():
                 <option value="overtime">Overtime</option>
               </select>
               <button id="go" class="secondary">Load</button>
-              <a class="nav-link" href="{{ url_for('admin_search') }}">Admin Search</a>
-              <a class="nav-link" href="{{ url_for('admin_tasks') }}">Tasks &amp; Estimation</a>
-              <a class="nav-link" href="{{ url_for('admin_efficiency') }}">Member Efficiency</a>
-              <a class="nav-link" href="{{ url_for('admin_export_csv') }}?date={{ selected_date }}">Export CSV</a>
-              <a class="nav-link" href="{{ url_for('admin_export_tasks_csv') }}?date={{ selected_date }}">Export Tasks CSV</a>
-              <a class="nav-link" href="{{ url_for('admin_export_builder') }}?date={{ selected_date }}">Export Builder</a>
-              <a class="nav-link" href="{{ url_for('admin_db') }}">DB Backup</a>
-              <a class="nav-link" href="{{ url_for('home') }}">Home</a>
+              <a class="nav-link" href="{{ url_for('admin_search') }}?team={{ team_id }}">Admin Search</a>
+              <a class="nav-link" href="{{ url_for('admin_tasks') }}?team={{ team_id }}">Tasks &amp; Estimation</a>
+              <a class="nav-link" href="{{ url_for('admin_efficiency') }}?team={{ team_id }}">Member Efficiency</a>
+              <a class="nav-link" href="{{ url_for('admin_export_csv') }}?team={{ team_id }}&date={{ selected_date }}">Export CSV</a>
+              <a class="nav-link" href="{{ url_for('admin_export_tasks_csv') }}?team={{ team_id }}&date={{ selected_date }}">Export Tasks CSV</a>
+              <a class="nav-link" href="{{ url_for('admin_export_builder') }}?team={{ team_id }}&date={{ selected_date }}">Export Builder</a>
+              <a class="nav-link" href="{{ url_for('admin_teams') }}?team={{ team_id }}">Teams</a>
+              <a class="nav-link" href="{{ url_for('admin_db') }}?team={{ team_id }}">DB Backup</a>
+              <a class="nav-link" href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
               <button id="logout" class="secondary">Logout</button>
             </div>
           </div>
@@ -2565,7 +3534,17 @@ def admin_report():
 
           document.getElementById("go").addEventListener("click", () => {
             const d = document.getElementById("d").value;
+            const team = document.getElementById("teamSel").value;
             const url = new URL(window.location.href);
+            url.searchParams.set("date", d);
+            url.searchParams.set("team", team);
+            window.location.href = url.toString();
+          });
+          document.getElementById("teamSel").addEventListener("change", () => {
+            const d = document.getElementById("d").value;
+            const team = document.getElementById("teamSel").value;
+            const url = new URL(window.location.href);
+            url.searchParams.set("team", team);
             url.searchParams.set("date", d);
             window.location.href = url.toString();
           });
@@ -2585,8 +3564,9 @@ def admin_report():
               const card = loginBtn.closest(".member-card");
               const timeVal = card.querySelector(".login-reset-time")?.value || "";
               const dateVal = document.getElementById("d").value;
+              const team = document.getElementById("teamSel").value;
               if (!member || !timeVal) return;
-              const res = await fetch("/admin/reset-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ member, date: dateVal, time: timeVal }) });
+              const res = await fetch("/admin/reset-login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ team, member, date: dateVal, time: timeVal }) });
               if (res.ok) window.location.reload();
               return;
             }
@@ -2595,7 +3575,8 @@ def admin_report():
               if (logoutBtn.classList.contains("btn-disabled")) return;
               const member = logoutBtn.dataset.member || "";
               const dateVal = document.getElementById("d").value;
-              const res = await fetch("/admin/reset-logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ member, date: dateVal }) });
+              const team = document.getElementById("teamSel").value;
+              const res = await fetch("/admin/reset-logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ team, member, date: dateVal }) });
               if (res.ok) window.location.reload();
               return;
             }
@@ -2612,6 +3593,8 @@ def admin_report():
 
     rendered = render_template_string(
         html,
+        team_id=team_id,
+        teams=_all_teams(),
         selected_date=selected_date,
         today=_today_str(),
         grouped=grouped,
@@ -2623,13 +3606,14 @@ def admin_report():
         task_label_map=task_label_map,
     )
     if not is_today:
-        _admin_report_cache[selected_date] = (time.time(), rendered)
+        _admin_report_cache[f"{team_id}:{selected_date}"] = (time.time(), rendered)
     return rendered
 
 
 @app.get("/admin/export.csv")
 def admin_export_csv():
     _require_admin()
+    team_id = _admin_team_id()
     anchor_date = request.args.get("date") or _today_str()
     try:
         anchor_date = _parse_date(anchor_date)
@@ -2646,7 +3630,8 @@ def admin_export_csv():
         end_date = anchor_date
 
     member_filter = (request.args.get("member") or "").strip()
-    members = MEMBER_NAMES if not member_filter else ([member_filter] if member_filter in MEMBER_NAMES else MEMBER_NAMES)
+    team_members = _team_members(team_id)
+    members = team_members if not member_filter else ([member_filter] if member_filter in team_members else team_members)
 
     allowed = [
         "date",
@@ -2672,10 +3657,10 @@ def admin_export_csv():
     for d in day_list:
         now_dt = datetime.now()
         for member in members:
-            data = _build_member_day_entries(member, d)
+            data = _build_member_day_entries(member, d, team_id)
             break_min = _break_minutes_for_pauses(data["pauses"], d, now_dt)
             for e in data["entries"]:
-                task_labels = [_task_label(str(t)) for t in e["tasks"]]
+                task_labels = [_task_label(str(t), team_id) for t in e["tasks"]]
                 row = {
                     "date": d,
                     "member": member,
@@ -2698,6 +3683,7 @@ def admin_export_csv():
 @app.get("/admin/export_tasks.csv")
 def admin_export_tasks_csv():
     _require_admin()
+    team_id = _admin_team_id()
     anchor_date = request.args.get("date") or _today_str()
     try:
         anchor_date = _parse_date(anchor_date)
@@ -2714,7 +3700,8 @@ def admin_export_tasks_csv():
         end_date = anchor_date
 
     member_filter = (request.args.get("member") or "").strip()
-    members = MEMBER_NAMES if not member_filter else ([member_filter] if member_filter in MEMBER_NAMES else MEMBER_NAMES)
+    team_members = _team_members(team_id)
+    members = team_members if not member_filter else ([member_filter] if member_filter in team_members else team_members)
 
     allowed = [
         "date",
@@ -2741,7 +3728,7 @@ def admin_export_tasks_csv():
     for d in day_list:
         now_dt = datetime.now()
         for member in members:
-            data = _build_member_day_entries(member, d)
+            data = _build_member_day_entries(member, d, team_id)
             break_min = _break_minutes_for_pauses(data["pauses"], d, now_dt)
             for e in data["entries"]:
                 spent_map = e.get("task_spent") or {}
@@ -2753,7 +3740,7 @@ def admin_export_tasks_csv():
                         "member": member,
                         "article": str(e["article"]),
                         "task_id": task_id,
-                        "task": _task_label(task_id),
+                        "task": _task_label(task_id, team_id),
                         "task_spent_min": str(round(float(tmin), 2)),
                         "task_spent_label": _minutes_label(tmin),
                         "status": "Completed" if bool(e["completed"]) else "In Progress",
@@ -2771,6 +3758,7 @@ def admin_export_tasks_csv():
 @app.get("/admin/export")
 def admin_export_builder():
     _require_admin()
+    team_id = _admin_team_id()
     selected_date = request.args.get("date") or _today_str()
     try:
         selected_date = _parse_date(selected_date)
@@ -2811,13 +3799,14 @@ def admin_export_builder():
               <div class="muted">Build a CSV export for Excel: pick date range, member, export type, and columns.</div>
             </div>
             <div class="row">
-              <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
-              <a href="{{ url_for('home') }}">Home</a>
+              <a href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
             </div>
           </div>
 
           <div class="card">
             <form method="GET" action="{{ url_for('admin_export_download') }}">
+              <input type="hidden" name="team" value="{{ team_id }}" />
               <div>
                 <label>Start date</label>
                 <input type="date" name="start" value="{{ selected_date }}" max="{{ today }}" />
@@ -2880,9 +3869,10 @@ def admin_export_builder():
     """
     return render_template_string(
         html,
+        team_id=team_id,
         selected_date=selected_date,
         today=_today_str(),
-        members=MEMBER_NAMES,
+        members=_team_members(team_id),
         summary_cols=[
             "date",
             "member",
@@ -2916,6 +3906,7 @@ def admin_export_builder():
 @app.get("/admin/export/download.csv")
 def admin_export_download():
     _require_admin()
+    team_id = _admin_team_id()
     export_type = (request.args.get("type") or "summary").strip().lower()
     start_date = request.args.get("start") or _today_str()
     end_date = request.args.get("end") or start_date
@@ -2925,13 +3916,13 @@ def admin_export_download():
         cols = request.args.getlist("task_cols_sel")
         if not cols:
             cols = request.args.getlist("cols")
-        args = {"start": start_date, "end": end_date, "member": member}
+        args = {"team": team_id, "start": start_date, "end": end_date, "member": member}
         if cols:
             args["cols"] = ",".join(cols)
         return redirect(url_for("admin_export_tasks_csv", **{k: v for k, v in args.items() if v}))
 
     cols = request.args.getlist("cols")
-    args = {"start": start_date, "end": end_date, "member": member}
+    args = {"team": team_id, "start": start_date, "end": end_date, "member": member}
     if cols:
         args["cols"] = ",".join(cols)
     return redirect(url_for("admin_export_csv", **{k: v for k, v in args.items() if v}))
@@ -2940,8 +3931,11 @@ def admin_export_download():
 @app.get("/admin/db")
 def admin_db():
     _require_admin()
+    team_id = _admin_team_id()
     mode = "Postgres" if _use_postgres() else "SQLite"
     restore_enabled = _sqlite_restore_enabled()
+    teams = _all_teams()
+    selected_name = next((t["name"] for t in teams if t["id"] == team_id), DEFAULT_TEAM_NAME)
     html = """
     <!doctype html>
     <html lang="en">
@@ -2973,8 +3967,8 @@ def admin_db():
               <div class="muted">Export a master backup. Optional restore is available only when explicitly enabled for local mode.</div>
             </div>
             <div class="row">
-              <a class="btn secondary" href="{{ url_for('admin_report') }}">Back To Admin Report</a>
-              <a class="btn secondary" href="{{ url_for('home') }}">Home</a>
+              <a class="btn secondary" href="{{ url_for('admin_report') }}?team={{ team_id }}">Back To Admin Report</a>
+              <a class="btn secondary" href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
             </div>
           </div>
 
@@ -2983,11 +3977,23 @@ def admin_db():
               <div class="pill">DB Mode: {{ mode }}</div>
               <div class="pill">Timezone: {{ timezone }}</div>
             </div>
+            <div class="row" style="margin-top: 10px; justify-content: space-between;">
+              <div class="pill">Team: {{ selected_name }}</div>
+              <form method="GET" action="{{ url_for('admin_db') }}" class="row">
+                <select name="team">
+                  {% for t in teams %}
+                    <option value="{{ t.id }}" {% if t.id == team_id %}selected{% endif %}>{{ t.name }}</option>
+                  {% endfor %}
+                </select>
+                <button type="submit">Switch</button>
+              </form>
+            </div>
             <div class="muted" style="margin-top: 10px;">
               For local shared-folder mode, set SQLITE_PATH to a shared folder and run the app. Then you can import/restore the master DB file if enabled.
             </div>
             <div class="row" style="margin-top: 12px;">
-              <a class="btn" href="{{ url_for('admin_db_export') }}">Download Master Backup</a>
+              <a class="btn" href="{{ url_for('admin_db_export') }}?team={{ team_id }}">Download Team Backup</a>
+              <a class="btn secondary" href="{{ url_for('admin_db_export') }}?mode=full">Download Full Backup</a>
             </div>
           </div>
 
@@ -3014,21 +4020,34 @@ def admin_db():
       </body>
     </html>
     """
-    return render_template_string(html, mode=mode, timezone=str(_APP_TZ), restore_enabled=restore_enabled)
+    return render_template_string(
+        html,
+        team_id=team_id,
+        teams=teams,
+        selected_name=selected_name,
+        mode=mode,
+        timezone=str(_APP_TZ),
+        restore_enabled=restore_enabled,
+    )
 
 
 @app.get("/admin/db/export")
 def admin_db_export():
     _require_admin()
-    if not _use_postgres():
+    mode = (request.args.get("mode") or "").strip().lower()
+    team_id = (request.args.get("team") or "").strip()
+    if team_id and not _team_exists(team_id):
+        team_id = DEFAULT_TEAM_ID
+    if not _use_postgres() and mode == "full":
         return _stream_sqlite_snapshot("master.sqlite3")
-    payload = _db_backup_payload()
+    payload = _db_backup_payload(team_id=team_id if mode != "full" else None)
     stamp = datetime.now(_APP_TZ).strftime("%Y%m%d_%H%M%S")
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    name = f"team_{team_id}_" if team_id and mode != "full" else "full_"
     return Response(
         data,
         mimetype="application/json",
-        headers={"Content-Disposition": f'attachment; filename="backup_{stamp}.json"'},
+        headers={"Content-Disposition": f'attachment; filename="{name}backup_{stamp}.json"'},
     )
 
 
