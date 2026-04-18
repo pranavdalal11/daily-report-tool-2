@@ -752,8 +752,39 @@ def _member_login_record_for_date(member: str, entry_date: str) -> dict | None:
     with _db() as conn:
         row = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1", (member, entry_date))
     if not row:
+        if entry_date == _today_str():
+            active = _active_shift_record(member)
+            if active and active.get("login_at") and not active.get("logout_at"):
+                return {"login_at": active["login_at"], "logout_at": active["logout_at"]}
         return None
     return {"login_at": _dt_to_iso(row["login_at"]), "logout_at": _dt_to_iso(row["logout_at"])}
+
+
+def _active_shift_record(member: str) -> dict | None:
+    today = _today_str()
+    with _db() as conn:
+        open_row = _fetchone(
+            conn,
+            _sql(
+                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
+                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND logout_at IS NULL ORDER BY entry_date DESC, login_at DESC LIMIT 1",
+            ),
+            (member,),
+        )
+        if open_row:
+            return {"entry_date": str(open_row["entry_date"]), "login_at": _dt_to_iso(open_row["login_at"]), "logout_at": _dt_to_iso(open_row["logout_at"])}
+
+        row = _fetchone(
+            conn,
+            _sql(
+                "SELECT entry_date::text AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1",
+                "SELECT entry_date AS entry_date, login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1",
+            ),
+            (member, today),
+        )
+    if not row:
+        return None
+    return {"entry_date": str(row["entry_date"]), "login_at": _dt_to_iso(row["login_at"]), "logout_at": _dt_to_iso(row["logout_at"])}
 
 
 def _member_login_for_date(member: str, entry_date: str) -> str | None:
@@ -1052,7 +1083,6 @@ def home():
       const taskMeta = {{ task_meta | tojson }};
       const isEditable = {{ "true" if editable else "false" }};
       const appTimeZone = "{{ app_timezone }}";
-      let forceReadOnly = false;
       let state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
 
       function selectedTasks(){ return Array.from(document.querySelectorAll(".taskBox")).filter(b=>b.checked).map(b=>b.value); }
@@ -1073,7 +1103,7 @@ def home():
         el.textContent = `${ids.length} task${ids.length===1?"":"s"} selected • ${formatMinutesLabel(total)}`;
       }
       function setBtn(btn, enabled, active){
-        const allow = !!isEditable && !forceReadOnly && !!enabled;
+        const allow = !!isEditable && !!enabled;
         btn.disabled = !allow;
         btn.classList.toggle("btn-active", !!active && allow);
         btn.classList.toggle("btn-faded", !allow || !active);
@@ -1085,7 +1115,7 @@ def home():
         const pauseBtn = document.getElementById("pauseBtn");
         const resumeBtn = document.getElementById("resumeBtn");
         const logoutBtn = document.getElementById("logoutBtn");
-        if(!isEditable || forceReadOnly){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
+        if(!isEditable){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!hasMember){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!state.loggedIn){ setBtn(loginBtn,true,true); setBtn(pauseBtn,false,false); setBtn(resumeBtn,false,false); setBtn(logoutBtn,false,false); return; }
         if(state.loggedOut){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
@@ -1096,14 +1126,14 @@ def home():
       function refreshSave(){
         const saveBtn = document.getElementById("saveBtn");
         const hasMember = !!document.getElementById("member").value;
-        saveBtn.disabled = !isEditable || forceReadOnly || !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
+        saveBtn.disabled = !isEditable || !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
       }
 
       function renderStatus(){
         const el = document.getElementById("status");
         const member = document.getElementById("member").value;
         if(!member){ el.textContent = isEditable ? "Select a member to begin the day." : "Past dates are view-only. Use the report panel to review saved entries."; return; }
-        if(!isEditable || forceReadOnly){ el.textContent = "A new day started. Reload the page to continue logging."; return; }
+        if(!isEditable){ el.textContent = "This date is locked for editing. Use the member report panel to review saved work."; return; }
         if(!state.loggedIn){ el.textContent = "Ready to log the shift. Start with Login."; return; }
         const loginText = state.loginAt ? state.loginAt.replace("T"," ") : "";
         const logoutText = state.loggedOut && state.logoutAt ? (" Logged out at " + state.logoutAt.replace("T"," ") + ".") : "";
@@ -1139,15 +1169,10 @@ def home():
         const data = await res.json().catch(()=>null);
         if(!res.ok || !data){ setMessage("Unable to load member status.", true); return; }
         const pageToday = document.getElementById("today").value;
-        if(data.today && pageToday && data.today !== pageToday){
-          forceReadOnly = true;
-          resetState();
-          setMessage("New day detected. Please reload the page and login again for today.", true);
-          renderStatus();
-          refreshButtons();
-          refreshSave();
-          updateSelectionSummary();
-          return;
+        const dayChanged = !!(data.today && pageToday && data.today !== pageToday);
+        if(dayChanged){
+          document.getElementById("today").value = data.today;
+          document.getElementById("reportDate").max = data.today;
         }
         state.loggedIn = !!data.logged_in;
         state.loggedOut = !!data.logged_out;
@@ -1156,6 +1181,13 @@ def home():
         state.pausedClosed = Number(data.paused_closed_seconds||0);
         state.openPauseStart = data.open_pause_start;
         state.openPause = !!data.open_pause_start && !state.loggedOut;
+        if(dayChanged){
+          if(state.loggedIn && !state.loggedOut){
+            setMessage(`New day started (${data.today}). Continuing current login session. Entries will save under today's date.`);
+          } else {
+            setMessage(`New day started (${data.today}). Please login to start today's work.`);
+          }
+        }
         renderStatus();
         refreshButtons();
         refreshSave();
@@ -1172,7 +1204,22 @@ def home():
 
       document.getElementById("member").addEventListener("change", ()=>{ setMessage("Ready when you are."); refreshStatus(); });
       document.querySelectorAll(".taskBox").forEach(b=>b.addEventListener("change", ()=>{ updateSelectionSummary(); refreshSave(); }));
-      document.getElementById("loginBtn").addEventListener("click", async ()=>{ try{ setMessage("Recording login..."); await postJson("/api/member-login",{member:document.getElementById("member").value}); setMessage("Login recorded."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
+      document.getElementById("loginBtn").addEventListener("click", async ()=>{
+        try{
+          setMessage("Recording login...");
+          const out = await postJson("/api/member-login",{member:document.getElementById("member").value});
+          if(out?.already_logged_out){
+            setMessage("Already logged out for today. Ask admin to reset logout if this is wrong.", true);
+          } else if(out?.already_logged_in){
+            setMessage("Already logged in.");
+          } else {
+            setMessage("Login recorded.");
+          }
+        }catch(e){
+          setMessage(e.message, true);
+        }
+        await refreshStatus();
+      });
       document.getElementById("pauseBtn").addEventListener("click", async ()=>{ try{ setMessage("Starting break..."); await postJson("/api/member-pause",{member:document.getElementById("member").value}); setMessage("Break started."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
       document.getElementById("resumeBtn").addEventListener("click", async ()=>{ try{ setMessage("Ending break..."); await postJson("/api/member-resume",{member:document.getElementById("member").value}); setMessage("Break ended."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); });
       document.getElementById("logoutBtn").addEventListener("click", async ()=>{ try{ setMessage("Recording logout..."); await postJson("/api/member-logout",{member:document.getElementById("member").value}); setMessage("Logout recorded."); }catch(e){ setMessage(e.message, true); } await refreshStatus(); refreshSave(); });
@@ -1232,12 +1279,8 @@ def home():
         const wait = Math.max(1000, next.getTime() - now.getTime());
         setTimeout(() => {
           if(!isEditable) return;
-          const ok = confirm("It's a new day. Switch to today's date now?");
-          if(ok){
-            window.location.href = "/";
-            return;
-          }
-          setTimeout(scheduleMidnightSwitch, 5 * 60 * 1000);
+          refreshStatus();
+          scheduleMidnightSwitch();
         }, wait);
       }
 
@@ -1245,7 +1288,7 @@ def home():
       refreshStatus();
       refreshSave();
       scheduleMidnightSwitch();
-      setInterval(()=>{ if(!forceReadOnly && isEditable) refreshStatus(); }, 60000);
+      setInterval(()=>{ if(isEditable) refreshStatus(); }, 60000);
     </script></body></html>
     """
 
@@ -1289,15 +1332,17 @@ def member_login_status():
     if not _valid_member(member):
         return jsonify({"error": "Select a valid member."}), 400
     entry_date = _today_str()
-    rec = _member_login_record_for_date(member, entry_date)
-    pause = _pause_state_for_member(member, entry_date)
+    shift = _active_shift_record(member)
+    active_date = shift.get("entry_date") if shift else entry_date
+    pause = _pause_state_for_member(member, active_date)
     return jsonify(
         {
             "today": entry_date,
-            "logged_in": bool(rec and rec.get("login_at")),
-            "logged_out": bool(rec and rec.get("logout_at")),
-            "login_at": rec.get("login_at") if rec else None,
-            "logout_at": rec.get("logout_at") if rec else None,
+            "active_entry_date": active_date,
+            "logged_in": bool(shift and shift.get("login_at")),
+            "logged_out": bool(shift and shift.get("logout_at")),
+            "login_at": shift.get("login_at") if shift else None,
+            "logout_at": shift.get("logout_at") if shift else None,
             "paused_closed_seconds": int(pause["paused_closed_seconds"]),
             "open_pause_start": pause["open_pause_start"],
         }
@@ -1311,10 +1356,13 @@ def member_login():
     if not _valid_member(member):
         return jsonify({"error": "Select a valid member."}), 400
     entry_date = _today_str()
+    active = _active_shift_record(member)
+    if active and active.get("login_at") and not active.get("logout_at"):
+        return jsonify({"ok": True, "already_logged_in": True})
     with _db() as conn:
         existing = _fetchone(conn, "SELECT login_at, logout_at FROM member_logins WHERE member=%s AND entry_date=%s LIMIT 1", (member, entry_date))
         if existing:
-            return jsonify({"ok": True, "already_logged_in": True})
+            return jsonify({"ok": True, "already_logged_in": True, "already_logged_out": bool(existing.get("logout_at"))})
         _execute(conn, "INSERT INTO member_logins(entry_date, member, login_at, logout_at) VALUES(%s,%s,NOW(),NULL)", (entry_date, member))
     return jsonify({"ok": True})
 
@@ -1325,12 +1373,12 @@ def member_pause():
     member = (payload.get("member") or "").strip()
     if not _valid_member(member):
         return jsonify({"error": "Select a valid member."}), 400
-    entry_date = _today_str()
-    rec = _member_login_record_for_date(member, entry_date)
-    if not rec or not rec.get("login_at"):
+    shift = _active_shift_record(member)
+    if not shift or not shift.get("login_at"):
         return jsonify({"error": "Member must login first."}), 400
-    if rec.get("logout_at"):
-        return jsonify({"error": "Member already logged out for today."}), 400
+    if shift.get("logout_at"):
+        return jsonify({"error": "Member already logged out."}), 400
+    entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
         open_row = _fetchone(conn, "SELECT id FROM member_pauses WHERE member=%s AND entry_date=%s AND pause_end IS NULL LIMIT 1", (member, entry_date))
         if open_row:
@@ -1345,10 +1393,10 @@ def member_resume():
     member = (payload.get("member") or "").strip()
     if not _valid_member(member):
         return jsonify({"error": "Select a valid member."}), 400
-    entry_date = _today_str()
-    rec = _member_login_record_for_date(member, entry_date)
-    if not rec or rec.get("logout_at"):
-        return jsonify({"error": "Member is not active for today."}), 400
+    shift = _active_shift_record(member)
+    if not shift or shift.get("logout_at"):
+        return jsonify({"error": "Member is not active."}), 400
+    entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
         _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE member=%s AND entry_date=%s AND pause_end IS NULL", (member, entry_date))
     return jsonify({"ok": True})
@@ -1360,12 +1408,12 @@ def member_logout():
     member = (payload.get("member") or "").strip()
     if not _valid_member(member):
         return jsonify({"error": "Select a valid member."}), 400
-    entry_date = _today_str()
-    rec = _member_login_record_for_date(member, entry_date)
-    if not rec or not rec.get("login_at"):
+    shift = _active_shift_record(member)
+    if not shift or not shift.get("login_at"):
         return jsonify({"error": "Member must login first."}), 400
-    if rec.get("logout_at"):
+    if shift.get("logout_at"):
         return jsonify({"ok": True})
+    entry_date = str(shift.get("entry_date") or _today_str())
     with _db() as conn:
         _execute(conn, "UPDATE member_pauses SET pause_end=NOW() WHERE member=%s AND entry_date=%s AND pause_end IS NULL", (member, entry_date))
         _execute(conn, "UPDATE member_logins SET logout_at=NOW() WHERE member=%s AND entry_date=%s", (member, entry_date))
@@ -1394,11 +1442,11 @@ def create_entry():
         return jsonify({"error": "Select at least one task."}), 400
 
     entry_date = _today_str()
-    rec = _member_login_record_for_date(member, entry_date)
-    if not rec or not rec.get("login_at"):
-        return jsonify({"error": "Member must login once for today before saving entries."}), 400
-    if rec.get("logout_at"):
-        return jsonify({"error": "Member already logged out for today. Saving is blocked."}), 400
+    shift = _active_shift_record(member)
+    if not shift or not shift.get("login_at"):
+        return jsonify({"error": "Member must login before saving entries."}), 400
+    if shift.get("logout_at"):
+        return jsonify({"error": "Member already logged out. Saving is blocked."}), 400
 
     with _db() as conn:
         _execute(
