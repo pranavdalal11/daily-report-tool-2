@@ -1052,6 +1052,7 @@ def home():
       const taskMeta = {{ task_meta | tojson }};
       const isEditable = {{ "true" if editable else "false" }};
       const appTimeZone = "{{ app_timezone }}";
+      let forceReadOnly = false;
       let state = { loggedIn:false, loggedOut:false, openPause:false, loginAt:null, logoutAt:null, pausedClosed:0, openPauseStart:null, timerId:null };
 
       function selectedTasks(){ return Array.from(document.querySelectorAll(".taskBox")).filter(b=>b.checked).map(b=>b.value); }
@@ -1072,7 +1073,7 @@ def home():
         el.textContent = `${ids.length} task${ids.length===1?"":"s"} selected • ${formatMinutesLabel(total)}`;
       }
       function setBtn(btn, enabled, active){
-        const allow = !!isEditable && !!enabled;
+        const allow = !!isEditable && !forceReadOnly && !!enabled;
         btn.disabled = !allow;
         btn.classList.toggle("btn-active", !!active && allow);
         btn.classList.toggle("btn-faded", !allow || !active);
@@ -1084,7 +1085,7 @@ def home():
         const pauseBtn = document.getElementById("pauseBtn");
         const resumeBtn = document.getElementById("resumeBtn");
         const logoutBtn = document.getElementById("logoutBtn");
-        if(!isEditable){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
+        if(!isEditable || forceReadOnly){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!hasMember){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
         if(!state.loggedIn){ setBtn(loginBtn,true,true); setBtn(pauseBtn,false,false); setBtn(resumeBtn,false,false); setBtn(logoutBtn,false,false); return; }
         if(state.loggedOut){ [loginBtn,pauseBtn,resumeBtn,logoutBtn].forEach(b=>setBtn(b,false,false)); return; }
@@ -1095,14 +1096,14 @@ def home():
       function refreshSave(){
         const saveBtn = document.getElementById("saveBtn");
         const hasMember = !!document.getElementById("member").value;
-        saveBtn.disabled = !isEditable || !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
+        saveBtn.disabled = !isEditable || forceReadOnly || !hasMember || !state.loggedIn || state.loggedOut || selectedTasks().length===0;
       }
 
       function renderStatus(){
         const el = document.getElementById("status");
         const member = document.getElementById("member").value;
         if(!member){ el.textContent = isEditable ? "Select a member to begin the day." : "Past dates are view-only. Use the report panel to review saved entries."; return; }
-        if(!isEditable){ el.textContent = "This date is locked for editing. Use the member report panel to review saved work."; return; }
+        if(!isEditable || forceReadOnly){ el.textContent = "A new day started. Reload the page to continue logging."; return; }
         if(!state.loggedIn){ el.textContent = "Ready to log the shift. Start with Login."; return; }
         const loginText = state.loginAt ? state.loginAt.replace("T"," ") : "";
         const logoutText = state.loggedOut && state.logoutAt ? (" Logged out at " + state.logoutAt.replace("T"," ") + ".") : "";
@@ -1137,6 +1138,17 @@ def home():
         const res = await fetch(`/api/member-login-status?member=${encodeURIComponent(member)}`);
         const data = await res.json().catch(()=>null);
         if(!res.ok || !data){ setMessage("Unable to load member status.", true); return; }
+        const pageToday = document.getElementById("today").value;
+        if(data.today && pageToday && data.today !== pageToday){
+          forceReadOnly = true;
+          resetState();
+          setMessage("New day detected. Please reload the page and login again for today.", true);
+          renderStatus();
+          refreshButtons();
+          refreshSave();
+          updateSelectionSummary();
+          return;
+        }
         state.loggedIn = !!data.logged_in;
         state.loggedOut = !!data.logged_out;
         state.loginAt = data.login_at;
@@ -1233,6 +1245,7 @@ def home():
       refreshStatus();
       refreshSave();
       scheduleMidnightSwitch();
+      setInterval(()=>{ if(!forceReadOnly && isEditable) refreshStatus(); }, 60000);
     </script></body></html>
     """
 
@@ -1280,6 +1293,7 @@ def member_login_status():
     pause = _pause_state_for_member(member, entry_date)
     return jsonify(
         {
+            "today": entry_date,
             "logged_in": bool(rec and rec.get("login_at")),
             "logged_out": bool(rec and rec.get("logout_at")),
             "login_at": rec.get("login_at") if rec else None,
