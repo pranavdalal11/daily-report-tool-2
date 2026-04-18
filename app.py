@@ -161,6 +161,7 @@ if os.environ.get("RENDER"):
 @app.before_request
 def _assign_request_id():
     ensure_db()
+    _metrics_inc_request()
     if request.path.startswith("/admin") and not _is_admin_session_valid():
         if request.path in {"/admin/login", "/admin/logout"}:
             pass
@@ -207,6 +208,13 @@ _ADMIN_REPORT_CACHE_TTL_SECONDS = 20.0
 _admin_report_cache: dict[str, tuple[float, str]] = {}
 _tasks_version_cache: dict[str, tuple[float, str]] = {}
 _teams_version_cache: tuple[float, str] | None = None
+_team_exists_cache: dict[str, tuple[float, bool]] = {}
+_team_members_cache: dict[str, tuple[float, str, list[str]]] = {}
+_all_teams_cache: tuple[float, str, list[dict]] | None = None
+_metrics_started_at = time.time()
+_metrics_lock = threading.Lock()
+_metrics_requests: dict[str, int] = {}
+_metrics_db_ops: dict[str, int] = {"fetchone": 0, "fetchall": 0, "execute": 0}
 
 _pool = None
 _db_initialized = False
@@ -562,6 +570,7 @@ def _db():
 
 
 def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
+    _metrics_inc_db("fetchone")
     if _use_postgres():
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
@@ -574,6 +583,7 @@ def _fetchone(conn, sql: str, params: tuple | None = None) -> dict | None:
 
 
 def _fetchall(conn, sql: str, params: tuple | None = None) -> list[dict]:
+    _metrics_inc_db("fetchall")
     if _use_postgres():
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
@@ -586,6 +596,7 @@ def _fetchall(conn, sql: str, params: tuple | None = None) -> list[dict]:
 
 
 def _execute(conn, sql: str, params: tuple | None = None) -> None:
+    _metrics_inc_db("execute")
     if _use_postgres():
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
@@ -927,6 +938,50 @@ def _clear_admin_session() -> None:
     session.pop("admin_sig", None)
 
 
+def _metrics_inc_request() -> None:
+    p = request.path or "/"
+    if p.startswith("/api/"):
+        key = p
+    elif p.startswith("/admin/"):
+        key = p
+    else:
+        key = "page:/"
+    with _metrics_lock:
+        _metrics_requests[key] = int(_metrics_requests.get(key) or 0) + 1
+
+
+def _metrics_inc_db(op: str) -> None:
+    with _metrics_lock:
+        _metrics_db_ops[op] = int(_metrics_db_ops.get(op) or 0) + 1
+
+
+def _metrics_snapshot() -> dict:
+    now = time.time()
+    with _metrics_lock:
+        req = dict(_metrics_requests)
+        db = dict(_metrics_db_ops)
+    uptime_s = max(1.0, now - _metrics_started_at)
+    day_factor = 86400.0 / uptime_s
+    month_factor = (30.0 * 86400.0) / uptime_s
+    req_total = sum(req.values())
+    db_total = sum(db.values())
+    return {
+        "uptime_seconds": int(uptime_s),
+        "requests_total": req_total,
+        "db_ops_total": db_total,
+        "requests_by_path": dict(sorted(req.items(), key=lambda kv: kv[1], reverse=True)[:30]),
+        "db_ops_by_type": db,
+        "projection_per_day": {
+            "requests": int(req_total * day_factor),
+            "db_ops": int(db_total * day_factor),
+        },
+        "projection_per_30d": {
+            "requests": int(req_total * month_factor),
+            "db_ops": int(db_total * month_factor),
+        },
+    }
+
+
 def _is_admin_session_valid() -> bool:
     if not session.get("admin"):
         return False
@@ -943,24 +998,56 @@ def _is_admin_session_valid() -> bool:
     return sig == _admin_token_sig(token, issued, fp)
 
 
+def _invalidate_team_caches(team_id: str | None = None) -> None:
+    global _all_teams_cache
+    if team_id:
+        tid = (team_id or "").strip()
+        _team_members_cache.pop(tid, None)
+        _team_exists_cache.pop(tid, None)
+    else:
+        _team_members_cache.clear()
+        _team_exists_cache.clear()
+    _all_teams_cache = None
+
+
 def _team_exists(team_id: str) -> bool:
     tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    now = time.time()
+    cached = _team_exists_cache.get(tid)
+    if cached and (now - cached[0]) < 30.0:
+        return cached[1]
     with _db() as conn:
         row = _fetchone(conn, "SELECT id FROM teams WHERE id=%s LIMIT 1", (tid,))
-    return bool(row)
+    ok = bool(row)
+    _team_exists_cache[tid] = (now, ok)
+    return ok
 
 
 def _all_teams() -> list[dict]:
+    global _all_teams_cache
+    ver = _global_teams_version(use_cache=True)
+    now = time.time()
+    if _all_teams_cache and _all_teams_cache[1] == ver and (now - _all_teams_cache[0]) < 60.0:
+        return _all_teams_cache[2]
     with _db() as conn:
         rows = _fetchall(conn, "SELECT id, name FROM teams ORDER BY name")
-    return [{"id": str(r["id"]), "name": str(r["name"])} for r in rows]
+    out = [{"id": str(r["id"]), "name": str(r["name"])} for r in rows]
+    _all_teams_cache = (now, ver, out)
+    return out
 
 
 def _team_members(team_id: str) -> list[str]:
     tid = (team_id or "").strip() or DEFAULT_TEAM_ID
+    ver = _global_teams_version(use_cache=True)
+    now = time.time()
+    cached = _team_members_cache.get(tid)
+    if cached and cached[1] == ver and (now - cached[0]) < 60.0:
+        return cached[2]
     with _db() as conn:
         rows = _fetchall(conn, "SELECT member FROM team_members WHERE team_id=%s AND active=TRUE ORDER BY member", (tid,))
-    return [str(r["member"]) for r in rows]
+    out = [str(r["member"]) for r in rows]
+    _team_members_cache[tid] = (now, ver, out)
+    return out
 
 
 def _get_team_id() -> str:
@@ -1056,6 +1143,7 @@ def _bump_global_teams_version() -> None:
             ("teams_version", ver),
         )
     _teams_version_cache = (time.time(), ver)
+    _invalidate_team_caches()
 
 
 def _bump_team_tasks_version(team_id: str) -> None:
@@ -1699,7 +1787,7 @@ def home():
       refreshSave();
       scheduleMidnightSwitch();
       setInterval(()=>{ if(isEditable) refreshStatus(); }, 60000);
-      setInterval(refreshTaskVersion, 15000);
+      setInterval(refreshTaskVersion, 60000);
     </script></body></html>
     """
 
@@ -1944,7 +2032,7 @@ def tasks_version():
 @app.get("/api/sync-version")
 def sync_version():
     team_id = _resolve_team_id()
-    v = f"{_team_tasks_version(team_id, use_cache=False)}:{_global_teams_version(use_cache=False)}"
+    v = f"{_team_tasks_version(team_id, use_cache=True)}:{_global_teams_version(use_cache=True)}"
     return jsonify({"team": team_id, "sync_version": v})
 
 
@@ -2019,6 +2107,70 @@ def admin_login_post():
 def admin_logout():
     _clear_admin_session()
     return jsonify({"ok": True})
+
+
+@app.get("/admin/metrics.json")
+def admin_metrics_json():
+    _require_admin()
+    return jsonify(_metrics_snapshot())
+
+
+@app.get("/admin/metrics")
+def admin_metrics_page():
+    _require_admin()
+    m = _metrics_snapshot()
+    html = """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Usage Metrics</title>
+        <style>
+          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 20px; background: #f8fafc; color: #0f172a; }
+          .wrap { max-width: 980px; margin: 0 auto; }
+          .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 14px; margin-top: 12px; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { border-bottom: 1px solid #eef2f7; padding: 8px; text-align: left; font-size: 13px; }
+          th { font-size: 12px; color: #475569; }
+          a { display: inline-block; margin-right: 8px; text-decoration: none; padding: 8px 10px; border-radius: 10px; border: 1px solid #cbd5e1; color: #0f172a; background: #e2e8f0; }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <h1 style="margin:0;">Usage Metrics</h1>
+          <div style="margin-top:8px;">
+            <a href="{{ url_for('admin_report') }}">Back To Admin Report</a>
+            <a href="{{ url_for('admin_metrics_json') }}">JSON</a>
+          </div>
+          <div class="card">
+            <div><b>Uptime:</b> {{ m.uptime_seconds }} sec</div>
+            <div><b>Requests Total:</b> {{ m.requests_total }}</div>
+            <div><b>DB Ops Total:</b> {{ m.db_ops_total }}</div>
+            <div><b>Projected/30d Requests:</b> {{ m.projection_per_30d.requests }}</div>
+            <div><b>Projected/30d DB Ops:</b> {{ m.projection_per_30d.db_ops }}</div>
+          </div>
+          <div class="card">
+            <h3 style="margin:0 0 8px;">DB Ops By Type</h3>
+            <table><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody>
+              {% for k,v in m.db_ops_by_type.items() %}
+                <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              {% endfor %}
+            </tbody></table>
+          </div>
+          <div class="card">
+            <h3 style="margin:0 0 8px;">Top Paths</h3>
+            <table><thead><tr><th>Path</th><th>Count</th></tr></thead><tbody>
+              {% for k,v in m.requests_by_path.items() %}
+                <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+              {% endfor %}
+            </tbody></table>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    return render_template_string(html, m=m)
 
 
 @app.post("/admin/reset-login")
@@ -2910,6 +3062,7 @@ def admin_team_member_add():
             else:
                 _execute(conn, "INSERT OR REPLACE INTO team_members(team_id, member, active) VALUES(?,?,1)", (team_id, member))
         _bump_team_tasks_version(team_id)
+        _invalidate_team_caches(team_id)
     except Exception:
         app.logger.exception("admin_team_member_add_failed")
     return redirect(url_for("admin_teams", team=team_id))
@@ -2926,6 +3079,7 @@ def admin_team_member_remove():
         with _db() as conn:
             _execute(conn, "UPDATE team_members SET active=FALSE WHERE team_id=%s AND member=%s", (team_id, member))
         _bump_team_tasks_version(team_id)
+        _invalidate_team_caches(team_id)
     except Exception:
         app.logger.exception("admin_team_member_remove_failed")
     return redirect(url_for("admin_teams", team=team_id))
@@ -3398,6 +3552,7 @@ def admin_report():
               <a class="nav-link" href="{{ url_for('admin_export_tasks_csv') }}?team={{ team_id }}&date={{ selected_date }}">Export Tasks CSV</a>
               <a class="nav-link" href="{{ url_for('admin_export_builder') }}?team={{ team_id }}&date={{ selected_date }}">Export Builder</a>
               <a class="nav-link" href="{{ url_for('admin_teams') }}?team={{ team_id }}">Teams</a>
+              <a class="nav-link" href="{{ url_for('admin_metrics_page') }}">Usage Metrics</a>
               <a class="nav-link" href="{{ url_for('admin_db') }}?team={{ team_id }}">DB Backup</a>
               <a class="nav-link" href="{{ url_for('home') }}?team={{ team_id }}">Home</a>
               <button id="logout" class="secondary">Logout</button>
